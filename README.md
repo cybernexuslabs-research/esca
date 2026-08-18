@@ -1,2 +1,18 @@
 # esca
 A honeypot MCP server that logs tool-calling behavior from LLM agents and clients.
+
+## Running it
+
+Run it directly with the standard library, no dependencies to install: `python3 mcp_honeypot.py [--host H] [--port P] [--log-file PATH]`. All three flags are optional (`--host` defaults to `127.0.0.1`, `--port` to `8000`, `--log-file` to `./honeypot.jsonl` resolved relative to the current working directory at startup, not to the script's location). Point an MCP client at `http://<host>:<port>/mcp` using the streamable-HTTP transport; the server only implements the single-request/single-response shape (`POST /mcp`, one JSON-RPC object in, one JSON-RPC object out) -- there is no SSE stream and no server-initiated messages. Every request produces one line appended to the JSONL log at `--log-file`, plus a sanitized, control-character-stripped one-line human-readable summary mirrored to stderr.
+
+**Operator caveats:**
+
+- The default bind (`127.0.0.1`) is safe for local testing. Rebinding to `0.0.0.0` to expose this as a real decoy on a network is an explicit opt-in risk the operator takes on -- this tool does not add authentication, TLS, or rate limiting.
+- Built-in resource-exhaustion mitigations in v1 are limited to a `SOCKET_TIMEOUT_SECONDS` (10s) per-read idle timeout per connection (this bounds time between individual reads, not the total duration a connection may stay open) and a `MAX_CONCURRENT_CONNECTIONS` (200) hard cap on simultaneous connections. Both are fixed constants near the top of `mcp_honeypot.py`, not CLI flags -- an operator who needs to tune them has to edit the source.
+- `honeypot.jsonl` has no rotation, size cap, or retention limit in v1. Unbounded disk growth under sustained traffic is an explicit operator responsibility, not something the tool manages -- and this includes rejected/malformed traffic, not just successfully-dispatched requests: the stdlib-rejection logging hooks mean garbage/scanner traffic (bad request lines, oversized headers, blank leading lines, etc.) also writes a JSONL line each.
+- `Transfer-Encoding: chunked` requests are rejected outright (HTTP 411), and duplicate `Content-Length` or duplicate `Transfer-Encoding` headers are each rejected outright (HTTP 400) -- v1's scope is simple JSON-RPC-over-POST, not general-purpose HTTP framing.
+- "Every request is logged" doesn't fully hold in three narrow, named cases. Two are genuinely structurally unloggable: connections refused at the `MAX_CONCURRENT_CONNECTIONS` cap, and a client that opens a connection and closes it again having sent zero bytes. The third is deliberately bounded rather than eliminated: more than `MAX_LEADING_BLANK_REQUEST_LINES` (default 5) consecutive blank/whitespace-only leading lines before a real request line ever arrives -- everything up to that bound is logged, and only a run longer than it silently drops the final line. Everything else is logged.
+
+## Testing
+
+Run the test suite with `python3 -m unittest test_mcp_honeypot -v` (57 tests, stdlib `unittest`, no extra dependencies).
