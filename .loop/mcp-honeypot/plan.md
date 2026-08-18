@@ -1,31 +1,70 @@
 # Plan: Build a minimal MCP (Model Context Protocol) honeypot in Python.
 
-Purpose: A decoy MCP server that appears to expose useful tools, logs everything a client does, and never performs any real action. Intended for observing how LLM agents and automated scanners interact with untrusted MCP servers.
-
-Scope for v1: Single file, stdlib plus at most one small dependency. No database, no web UI, no alerting. Getting complete, well-structured logs is the only goal.
-
-Protocol surface: Serve MCP over streamable HTTP on a configurable host/port (default 127.0.0.1:8000). Handle enough JSON-RPC 2.0 to keep a real client talking: initialize (return protocolVersion, serverInfo, capabilities [tools only]), notifications/initialized, tools/list (return the fake tool catalog), tools/call (return canned fake results), ping. Any unknown method returns a well-formed JSON-RPC error rather than crashing or closing the connection. Malformed JSON gets a -32700 parse error and is still logged.
-
-Fake tool catalog: Four tools with realistic names, descriptions, and JSON Schemas -- plausible enough that an agent would try them, e.g. a file reader, a database query runner, a credential/secret lookup, and an outbound email sender. Each returns static or templated fake data. Nothing touches the filesystem, network, shell, or any real service.
-
-Logging: Append one JSON object per line to a JSONL file (default ./honeypot.jsonl): ISO 8601 UTC timestamp; source IP and port; request HTTP headers (at minimum User-Agent); session identifier, if the client provides one; the raw request body as received; the parsed method name, and for tools/call the tool name and full arguments; the response the honeypot returned. Log before responding so nothing is lost if a handler raises. Also mirror a one-line human-readable summary to stderr.
-
-Safety rules (non-negotiable): Never eval, exec, subprocess, or import anything derived from client input. Never make outbound network requests. Never read or write files outside the log path. Log file is append-only; treat every logged value as untrusted text.
-
-Deliverables: The honeypot source file. A one-paragraph README: how to run it, where logs go, how to point an MCP client at it for testing.
-
 ## Goal
 
+Build a single-file Python MCP honeypot that speaks just enough of the MCP JSON-RPC protocol over streamable HTTP to keep a real client or scanner talking, exposes four plausible-but-fake tools, performs no real action ever, and produces complete, append-only JSONL logs of every request/response plus a one-line human-readable mirror on stderr.
+
 ## Assumptions
+
+- Repo is currently greenfield for code (only `.claude/`, `.loop-templates/`, `.gitignore`, and a one-line `README.md` exist). This plan establishes the only source file and its conventions; there is no prior Python style to defer to.
+- Target Python 3.10+ (widely available, no external tooling required to run it — `python3 honeypot.py` should just work).
+- "MCP client" for testing purposes means the official MCP Python/TypeScript SDK client (or an equivalent hand-rolled JSON-RPC-over-HTTP client / scanner) speaking the streamable HTTP transport introduced in the 2025-03-26 MCP spec revision.
+- No authentication, TLS, or access control is expected or desired — decoys are conventionally exposed without auth so that scanners/agents engage with them; adding auth would reduce catch rate and is explicitly out of scope per "no alerting" / minimal-surface framing.
+- The operator (not the honeypot) is responsible for where they run this and for the sensitivity of what ends up in `honeypot.jsonl` (it will contain raw, untrusted attacker/agent input verbatim). Protecting or rotating that file is an operational concern, not a feature to build.
+- "One small dependency" in the goal is a ceiling, not a requirement — see Approach for why v1 needs zero third-party dependencies.
+- Default log path `./honeypot.jsonl` is relative to the process's working directory at start time, not to the source file's location.
 
 ## Scope
 
 ### In Scope
 
+- One Python source file (`mcp_honeypot.py` at repo root) containing: HTTP server, JSON-RPC 2.0 message parsing/dispatch, the four fake tool definitions and canned responses, JSONL request/response logging, and the stderr summary line.
+- CLI arguments (stdlib `argparse`): `--host` (default `127.0.0.1`), `--port` (default `8000`), `--log-file` (default `./honeypot.jsonl`). No config file, no env-var-driven config.
+- MCP methods handled: `initialize`, `notifications/initialized`, `tools/list`, `tools/call`, `ping`. Any other method name returns a well-formed JSON-RPC `-32601 Method not found` error. Malformed JSON returns `-32700 Parse error`. Both are logged like any other exchange.
+- Streamable HTTP transport, restricted to the single-request/single-response shape: client `POST`s one JSON-RPC object to one endpoint (e.g. `/mcp`), server replies with one JSON body per response. No SSE stream, no server-initiated messages, no batched (array) JSON-RPC requests.
+- A server-generated `Mcp-Session-Id` returned (as a response header) after a successful `initialize`, tracked in an in-memory (non-persisted) dict purely so subsequent log lines from the same client can be correlated. No enforcement of session-id presence/validity on later calls — a client that skips it is still served and logged.
+- Four fake tools with realistic names, descriptions, and JSON Schema `inputSchema`s: a file reader, a database query runner, a credential/secret lookup, and an outbound email sender. Each returns static or lightly templated fake data (may echo back the caller's arguments, e.g. the requested path/query, into the fake response text) and never touches the real filesystem, network, or shell.
+- JSONL logging: one record per HTTP request, written and flushed to disk *before* the HTTP response is sent, guarded by a `threading.Lock` (the server is threaded, so writes could otherwise interleave/corrupt lines).
+- A one-line, control-character-stripped human-readable summary of each event mirrored to stderr.
+- Defensive guardrails: a capped max request body size (reject/log oversized bodies rather than reading unboundedly into memory), a catch-all exception handler around each request so any internal error becomes a logged `-32603 Internal error` JSON-RPC response instead of a crash or a hung/dropped connection, and non-UTF-8 request bodies decoded with `errors="replace"` so they can still be logged instead of raising.
+- Updating the existing root `README.md` with the one-paragraph run/log-location/client-pointing instructions the goal asks for (this repo already has a one-line `README.md` stub naming the project; extend it rather than adding a second top-level doc).
+- Adding `/honeypot.jsonl` to `.gitignore` so default test-run output doesn't get committed by accident.
+
 ### Out of Scope
+
+- SSE streaming, resumable streams, server-to-client notifications/requests, and any MCP capability other than `tools` (no `resources`, `prompts`, `sampling`, `roots`, `completion`).
+- JSON-RPC batch requests (arrays of requests in one body).
+- Authentication, TLS/HTTPS, rate limiting, IP allow/deny lists, or any abuse mitigation beyond the basic body-size cap.
+- Any persistence beyond the JSONL log: no database, no web UI/dashboard, no alerting/notification integrations (explicitly excluded by the goal).
+- Log rotation, retention limits, compression, or encryption of `honeypot.jsonl`.
+- Packaging, containerization, systemd units, or other deployment tooling beyond the README's plain `python3` invocation.
+- An automated test suite is not a stated deliverable; downstream design/QA may choose to add stdlib-`unittest`-based tests (e.g. exercising the dispatch/logging functions directly, or an end-to-end smoke test via `http.client`) but that decision and its scope belongs to `design.md`/QA, not this plan.
+- Making the honeypot resemble a *specific* real product's MCP server (naming, exact error text, etc.) — "plausible enough that an agent would try them" is satisfied by realistic-sounding generic tool names/descriptions, not by impersonating any named vendor.
 
 ## Approach
 
+**Stack decision:** stdlib only, zero third-party dependencies. `http.server.ThreadingHTTPServer` + a `BaseHTTPRequestHandler` subclass is sufficient to implement a single JSON-RPC POST endpoint; `json`, `argparse`, `threading`, `uuid`, `datetime`, and `socketserver` cover everything else needed. This is preferable to pulling in an MCP SDK or a web framework (Flask/FastAPI) because: (a) the goal caps deps at "at most one small dependency" and stdlib satisfies the requirement with zero, minimizing what a security reviewer has to trust and what an operator has to `pip install` before running a security-sensitive tool on a possibly-isolated box; (b) the protocol surface required is intentionally tiny (5 methods, no streaming), so a framework's extra machinery (routing, middleware, async event loops) buys nothing here; (c) a hand-rolled dispatcher makes it trivial to guarantee the "log before responding, never let a handler exception kill the connection" invariant, since every code path funnels through one `try/except` wrapper the honeypot fully controls.
+
+**Transport shape:** Implement the streamable HTTP transport's minimum viable slice: a single path (`POST /mcp`) accepts one JSON-RPC object per request and returns `Content-Type: application/json` with either a JSON-RPC result or error object in the body — never SSE. `GET /mcp` (which a spec-compliant client may probe to open a server-initiated SSE stream) returns `405 Method Not Allowed`; this is spec-permitted (a server that doesn't offer the optional SSE stream returns 405, and compliant clients fall back to plain request/response), and matches "enough JSON-RPC 2.0 to keep a real client talking" without taking on streaming complexity. `DELETE /mcp` (session termination) also returns 405 rather than being unimplemented-but-silently-ignored, keeping every response well-formed per the safety rule against ever just dropping/crashing a connection.
+
+**HTTP status vs. JSON-RPC error split:** Transport-level problems (wrong path → 404, wrong HTTP method → 405, oversized body → 413) use HTTP status codes with no JSON-RPC body. Anything that is valid enough to be treated as a JSON-RPC exchange attempt — unparseable JSON, unknown method, bad params, internal handler error — gets **HTTP 200** with a JSON-RPC error object (`-32700`, `-32601`, `-32602`, `-32603` respectively) in the body, consistent with common JSON-RPC-over-HTTP practice and with keeping the connection looking "normal" to a scanner. This distinction is a deliberate v1 choice the architect should carry through to the design rather than re-litigate.
+
+**Logging record shape (one JSON object per line):** `ts` (ISO 8601 UTC via `datetime.now(timezone.utc).isoformat()`), `client_ip`, `client_port`, `headers` (dict of all received headers, values kept as opaque strings — never interpreted), `session_id` (from `Mcp-Session-Id` request header if present, else `null`), `raw_body` (the exact bytes received, decoded UTF-8 with `errors="replace"`, unmodified even if JSON parsing fails), `method` (parsed JSON-RPC `method`, `null` if body wasn't parseable), `tool_name`/`tool_arguments` (populated only when `method == "tools/call"`), and `response` (the exact JSON-RPC body — or transport-level outcome, e.g. `"202 Accepted (notification)"` — that was actually sent). The handler builds the full response object first, appends the log line (write + flush, lock-protected) with that response already embedded, and only then writes the HTTP response to the socket, satisfying "log before responding."
+
+**Fake tool catalog** (names indicative, not final): `read_file` (path → templated fake file contents echoing the requested path), `query_database` (query/database name → canned fake rows), `get_credential`/`lookup_secret` (name → a static, obviously-synthetic fake secret string, not a realistic-looking live-looking token, so the log/response can never be mistaken for a real leak while the tool's *description* is still what makes it enticing), and `send_email` (to/subject/body → fake "sent" confirmation with a fake message id). Every tool handler is a pure function over the parsed arguments that only builds a string/dict to return — no branch anywhere touches `os`, `subprocess`, `socket`, `urllib`, `open()`, `eval`, `exec`, or dynamic `import`.
+
+**Concurrency and durability:** `ThreadingHTTPServer` gives one thread per connection; a single `threading.Lock` around the JSONL append (and around the in-memory session dict) prevents interleaved writes/races. No log rotation or size limits in v1 (explicitly out of scope, matching "no database, no alerting" framing) — an operator running this for a long time is expected to manage the file externally.
+
 ## Risks
 
+- **Safety rules are hard constraints, not aspirations.** Non-negotiable for this build: never `eval`/`exec`/`subprocess`/dynamic `import` on anything derived from client input; never make an outbound network call of any kind (including to "resolve" or "validate" anything the client sent); never read or write any path other than the configured log file; treat every logged value as untrusted opaque text (never format it into a shell command, SQL string, template engine, or similar). This must hold even when it makes tool responses less "realistic" — e.g. `read_file` may echo the requested path back into fake content, but must never actually call `open()` on it. Security review (plan-phase and code-phase) should specifically verify these against the final source, not just the plan.
+- **Untrusted input abuse via the logging path itself.** A malicious client can put newlines, ANSI/terminal escape sequences, or arbitrarily large values into headers, the body, or tool arguments. If the stderr "one-line summary" doesn't strip/escape control characters and newlines, an attacker can forge fake log lines or corrupt the terminal; the JSONL file is safe by construction (JSON-encodes everything) but the stderr mirror needs explicit sanitization. Also need a hard cap on bytes read from the request body (reject oversized bodies with 413 before buffering them fully) to avoid a trivial memory-exhaustion DoS — a honeypot that can be knocked over by one large POST defeats its own purpose.
+- **Protocol version drift.** MCP's `protocolVersion` string in the `initialize` response must match something the connecting client accepts or a strict client may refuse to proceed after the handshake. Since the honeypot's job is to capture the *attempt* regardless of what happens after, this is a correctness/plausibility risk rather than a logging risk — even a rejected handshake is still fully logged. Plan is to advertise a recent, widely-supported version string; exact value is an architect-level detail.
+- **`ThreadingHTTPServer` has no built-in connection/thread limits.** Fine for the default `127.0.0.1` binding aimed at local testing; if an operator rebinds to `0.0.0.0` to actually expose this as a decoy, unbounded thread-per-connection plus the removed body-size cap concern above becomes a real resource-exhaustion vector. README should carry an explicit warning about this default-safe/opt-in-risk tradeoff rather than the code trying to solve internet-facing hardening in v1.
+- **Backward compatibility:** none — this is a new file in a repo with no prior code, so there's nothing to break.
+
 ## Open Questions / Pushback
+
+- **Exact `protocolVersion` string to advertise** in `initialize` is left to the architect/design phase rather than pinned here; any recent MCP spec date string is acceptable as long as it's real and documented, since the honeypot logs the handshake attempt regardless of whether the client subsequently proceeds.
+- **Whether to support JSON-RPC batch (array) request bodies** was deliberately scoped out — the MCP spec's streamable HTTP transport has moved away from mandating batch support, and the goal only asks for "enough JSON-RPC 2.0 to keep a real client talking," which single-object request/response satisfies. If a specific scanner under observation turns out to rely on batching, that would be a follow-up, not a v1 requirement.
+- **Session-id enforcement is intentionally permissive** (issued but never required/validated on subsequent calls). A stricter honeypot could reject calls missing a previously-issued `Mcp-Session-Id` to look more "production-like," but that risks turning away exactly the scanners/agents this tool exists to observe, so v1 favors maximum engagement over protocol strictness.
