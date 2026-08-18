@@ -26,7 +26,7 @@
     {
       "id": 3,
       "title": "Fake tool catalog + tools/list + tools/call + -32602 argument validation",
-      "status": "pending",
+      "status": "in_progress",
       "code_review": {"round": 0, "cap": 5, "verdict": "pending"}
     },
     {
