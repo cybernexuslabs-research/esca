@@ -8,7 +8,7 @@ Protocol surface: Serve MCP over streamable HTTP on a configurable host/port (de
 
 Fake tool catalog: Four tools with realistic names, descriptions, and JSON Schemas -- plausible enough that an agent would try them, e.g. a file reader, a database query runner, a credential/secret lookup, and an outbound email sender. Each returns static or templated fake data. Nothing touches the filesystem, network, shell, or any real service.
 
-Logging: Append one JSON object per line to a JSONL file (default ./honeypot.jsonl): ISO 8601 UTC timestamp; source IP and port; request HTTP headers (at minimum User-Agent); session identifier, if the client provides one; the raw request body as received; the parsed method name, and for tools/call the tool name and full arguments; the response the honeypot returned. Log before responding so nothing is lost if a handler raises. Also mirror a one-line human-readable summary to stderr. **Round 1 revision:** "one record per HTTP request" is literal -- every request that reaches `_handle_request` (including 404s, 405s, and 413s) produces exactly one JSONL record. **Round 2 revision:** logging completeness now extends *below* `_handle_request` too -- a narrow `log_error` override on the HTTP handler (see § Architecture Overview and § Data Flow) captures the stdlib's own pre-dispatch rejections (malformed/oversized request lines, unsupported HTTP versions, unimplemented verbs, and a client that stalls before ever completing a request line), closing what Round 2 review found to be an undercounted "two named exceptions" claim. Exactly two structurally-unloggable cases remain, both now precisely named rather than approximated -- see § Data Flow, "Universal logging: what's covered and what genuinely isn't."
+Logging: Append one JSON object per line to a JSONL file (default ./honeypot.jsonl): ISO 8601 UTC timestamp; source IP and port; request HTTP headers (at minimum User-Agent); session identifier, if the client provides one; the raw request body as received; the parsed method name, and for tools/call the tool name and full arguments; the response the honeypot returned. Log before responding so nothing is lost if a handler raises. Also mirror a one-line human-readable summary to stderr. **Round 1 revision:** "one record per HTTP request" is literal -- every request that reaches `_handle_request` (including 404s, 405s, and 413s) produces exactly one JSONL record. **Round 2 revision:** logging completeness now extends *below* `_handle_request` too -- a narrow `log_error` override on the HTTP handler (see § Architecture Overview and § Data Flow) captures the stdlib's own pre-dispatch rejections (malformed/oversized request lines, unsupported HTTP versions, unimplemented verbs, and a client that stalls before ever completing a request line), closing what Round 2 review found to be an undercounted "two named exceptions" claim. **Round 3 revision:** one further gap in the Round 2 fix itself was found and closed -- a blank/whitespace-only first request line causes CPython's `parse_request()` to return `False` without ever calling `send_error()`/`log_error()`, so that specific case was structurally invisible to the `log_error` override (verified empirically against live CPython 3.14). A second, narrower `handle_one_request()` override now catches it directly. After both fixes, two cases remain genuinely structurally unloggable (no stdlib hook fires at all, ever) and one further case is deliberately bounded-by-design rather than eliminated -- see § Data Flow, "Universal logging: what's covered and what genuinely isn't" for the precise, current three-item list.
 
 Safety rules (non-negotiable): Never eval, exec, subprocess, or import anything derived from client input. Never make outbound network requests. Never read or write files outside the log path. Log file is append-only; treat every logged value as untrusted text.
 
@@ -16,7 +16,7 @@ Deliverables: The honeypot source file. A one-paragraph README: how to run it, w
 
 ---
 
-**Review disposition.** This revision resolves all 9 `review-notes.md` Round 1 findings, all 5 `security-plan-review.md` Round 1 findings, all 5 `review-notes.md` Round 2 findings, and folds in all 3 `security-plan-review.md` Round 2 minor notes (Round 2 security verdict was APPROVED; these 3 notes were explicitly non-blocking but cheap to address). Per-finding summaries are at the end of this document; findings are referenced inline as `[RN-#]`/`[SEC-#]` (Round 1) and `[RN2-#]`/`[SEC2-x]` (Round 2) at the point each is resolved.
+**Review disposition.** This revision resolves all 9 `review-notes.md` Round 1 findings, all 5 `security-plan-review.md` Round 1 findings, all 5 `review-notes.md` Round 2 findings, all 2 `review-notes.md` Round 3 findings, and folds in all 3 `security-plan-review.md` Round 2 minor notes plus 2 of the 3 `security-plan-review.md` Round 3 minor notes (Round 2 and Round 3 security verdicts were both APPROVED; all of these notes were explicitly non-blocking, and cheap enough to fold in except the third Round 3 note, which the security review itself flagged as documentation-only with no action needed). Per-finding summaries are at the end of this document; findings are referenced inline as `[RN-#]`/`[SEC-#]` (Round 1), `[RN2-#]`/`[SEC2-x]` (Round 2), and `[RN3-#]`/`[SEC3-x]` (Round 3) at the point each is resolved.
 
 ## Architecture Overview
 
@@ -24,11 +24,11 @@ This is a greenfield addition to an otherwise-empty repo (`.claude/`, `.loop-tem
 
 The whole system is one process, one file, three logical layers stacked inside it, in this order:
 
-1. **Transport layer** -- a `HoneypotHTTPServer(ThreadingHTTPServer)` subclass that adds a bounded concurrent-connection cap, plus a `HoneypotRequestHandler(BaseHTTPRequestHandler)` subclass that owns the socket, HTTP method/path routing, a per-connection read timeout, request-body reading with a hard size cap, and writing the HTTP response. **Every** request that reaches a `do_*` method is funneled through one shared method, `_handle_request(self, http_method: str)`, so logging there is universal rather than conditional on reaching the JSON-RPC dispatcher `[RN-1] [SEC-3]`. **New in Round 2:** requests that *never* reach a `do_*` method -- because the stdlib itself rejected them while parsing the request line/headers, or because the client stalled before sending a request line at all -- are now also captured, via a narrow override of `HoneypotRequestHandler.log_error()` (the stdlib's own single internal hook for exactly these cases; see § Data Flow, "Universal logging via a `log_error` override"). This closes the gap Round 2 review found in the "two named exceptions" framing `[RN2-1] [SEC2-b]`. Neither layer interprets the body as anything other than bytes/JSON.
+1. **Transport layer** -- a `HoneypotHTTPServer(ThreadingHTTPServer)` subclass that adds a bounded concurrent-connection cap, plus a `HoneypotRequestHandler(BaseHTTPRequestHandler)` subclass that owns the socket, HTTP method/path routing, a per-connection read timeout, request-body reading with a hard size cap, and writing the HTTP response. **Every** request that reaches a `do_*` method is funneled through one shared method, `_handle_request(self, http_method: str)`, so logging there is universal rather than conditional on reaching the JSON-RPC dispatcher `[RN-1] [SEC-3]`. **New in Round 2:** requests that *never* reach a `do_*` method -- because the stdlib itself rejected them while parsing the request line/headers, or because the client stalled before sending a request line at all -- are now also captured, via a narrow override of `HoneypotRequestHandler.log_error()` (the stdlib's own single internal hook for exactly these cases; see § Data Flow, "Universal logging via a `log_error` override"). This closes the gap Round 2 review found in the "two named exceptions" framing `[RN2-1] [SEC2-b]`. **New in Round 3:** one specific stdlib-rejection case -- a blank/whitespace-only first request line -- turned out to bypass the `log_error` override entirely, since CPython's `parse_request()` returns `False` for it without calling `send_error()`/`log_error()` at all (empirically verified against live CPython 3.14: raw `b"\r\n"` produces zero response bytes and zero `log_error` calls). A second, narrower override of `HoneypotRequestHandler.handle_one_request()` now detects this specific case directly (rather than via `log_error`, since `log_error` is provably never called here) and logs it before falling through to normal parsing `[RN3-1]`; see § Data Flow, "Universal logging via a `handle_one_request` override." Neither layer interprets the body as anything other than bytes/JSON.
 2. **Protocol/dispatch layer** -- pure(ish) functions that take a parsed JSON-RPC message plus a small immutable request-context object and return a `DispatchResult` (see § Data Flow). This layer has no socket access and does no I/O of its own; it is the seam the design keeps free of `BaseHTTPRequestHandler` so it can be exercised directly.
 3. **Logging layer** -- a small `JSONLogWriter` class wrapping a single already-open file handle plus a `threading.Lock`, and a `sanitize_for_stderr` helper. The transport layer calls this *after* building the full response object but *before* writing bytes to the client socket, satisfying "log before responding." The log write itself is individually fault-tolerant: a failure to write (disk full, permission error, etc.) is caught locally and never prevents the HTTP response from being sent `[RN-6]`. **Every** code path that logs anything -- the normal `_handle_request` flow, the new `log_error` override, and `_emergency_fallback` -- calls through this *same* `JSONLogWriter.write()` instance and therefore the *same* lock; none of them opens a second file handle or writes to the file directly `[SEC2-c]` (see § Data Flow, `_emergency_fallback`).
 
-There are no other components, no external services, no persistence beyond the JSONL file, and no dependencies beyond the Python 3 standard library (`http.server`, `socketserver`, `json`, `argparse`, `threading`, `uuid`, `datetime`, `re`, `dataclasses`, `collections`, `email.message`, `sys`). This matches the plan's stack decision exactly; nothing in the repo contradicts or constrains it.
+There are no other components, no external services, no persistence beyond the JSONL file, and no dependencies beyond the Python 3 standard library (`http`, `http.server`, `socketserver`, `json`, `argparse`, `threading`, `uuid`, `datetime`, `re`, `dataclasses`, `collections`, `email.message`, `sys`). This matches the plan's stack decision exactly; nothing in the repo contradicts or constrains it. **New in Round 3:** `http` (specifically `http.HTTPStatus`) is now imported directly by the module's own code, not just used implicitly via `http.server`'s internals, since the new `handle_one_request()` override reproduces two of the stdlib's own `HTTPStatus`-using `send_error()` calls.
 
 **Stated reliance on a stdlib-enforced limit `[SEC-5]`.** One protection in this design is enforced by the Python standard library rather than by code we write, and is called out explicitly here so a future maintainer doesn't accidentally swap in a handler base class that lacks it: **HTTP header count/line-length limits.** `http.server`'s request parsing goes through `http.client.parse_headers()`, which enforces `http.client._MAXHEADERS` (100 headers) and per-line length limits before `do_*` is ever invoked. We do **not** additionally cap header count/size ourselves in v1; the stdlib ceiling is judged sufficient given the honeypot's threat model (a header-flood attack at that scale is a pathological stress case rather than realistic scanner/agent traffic, and it still can't crash the process or bypass the body-size cap). **Round 2 change:** in Round 1, a request that tripped this limit was one of the "two named exceptions" to universal logging -- rejected by the stdlib *and* unlogged. As of this revision it is still rejected by the stdlib (we still don't reimplement the limit itself), but the rejection **is now logged**, via the same `log_error` override described above `[RN2-1]`. The stdlib enforces the ceiling; our code now observes and records every time it fires.
 
@@ -39,14 +39,14 @@ There are no other components, no external services, no persistence beyond the J
 Everything lives in one new file at the repo root: **`mcp_honeypot.py`**. Internally it is organized top-to-bottom as (this ordering is also the build order in Task Breakdown below):
 
 - **CLI / entrypoint** -- `build_arg_parser() -> argparse.ArgumentParser` (`--host` default `127.0.0.1`, `--port` default `8000`, `--log-file` default `./honeypot.jsonl` -- no new flags added; all new v1 hardening constants below are code-level, not CLI-configurable, to keep the CLI surface exactly matching plan.md) and `main(argv: list[str] | None = None) -> int`. All server-starting side effects live inside `main()`, guarded by `if __name__ == "__main__":` -- importing the module (e.g. from a future test or the QA phase) must never open a socket or a file. This is the primary testability seam for the whole design.
-- **Module-level constants** (new, named, near the top of the file so an operator can tune them by editing the file): `MAX_BODY_BYTES = 1_048_576` (1 MiB request body cap), `SOCKET_TIMEOUT_SECONDS = 10` (per-connection idle/read timeout `[RN-8] [SEC-1]`, see the accepted-tradeoff note above `[SEC2-a]`), `MAX_CONCURRENT_CONNECTIONS = 200` (hard cap on simultaneously-handled connections `[SEC-1]`), `MAX_SESSIONS = 10_000` (cap on the in-memory session store, oldest evicted first `[SEC-2]`).
+- **Module-level constants** (new, named, near the top of the file so an operator can tune them by editing the file): `MAX_BODY_BYTES = 1_048_576` (1 MiB request body cap), `SOCKET_TIMEOUT_SECONDS = 10` (per-connection idle/read timeout `[RN-8] [SEC-1]`, see the accepted-tradeoff note above `[SEC2-a]`), `MAX_CONCURRENT_CONNECTIONS = 200` (hard cap on simultaneously-handled connections `[SEC-1]`), `MAX_SESSIONS = 10_000` (cap on the in-memory session store, oldest evicted first `[SEC-2]`), `MAX_LEADING_BLANK_REQUEST_LINES = 5` (new in Round 3 -- bounds how many consecutive blank/whitespace-only leading request lines the `handle_one_request()` override will log-and-skip per connection before giving up, so the fix for `[RN3-1]` can't itself become an unbounded read/log loop; see § Data Flow).
 - **Logging core** -- `JSONLogWriter` (holds the open file handle + `threading.Lock`, exposes `write(record: dict) -> None`; this is the *single* writer instance used by every logging call site in the file `[SEC2-c]`), `build_log_record(...) -> dict` (pure function assembling the record shape below, including `http_method`/`path` since every HTTP request that reaches `_handle_request` is logged), `build_stdlib_rejection_record(...) -> dict` (new `[RN2-1]` -- pure function assembling a record for the stdlib-rejection cases the `log_error` override captures; see § Data Flow), `headers_to_dict(msg: email.message.Message) -> dict[str, str]` (duplicate-header comma-join policy `[RN-7]`), `sanitize_for_stderr(text: str, max_len: int = 300) -> str`, and `emit_stderr_summary(record: dict) -> None`.
-- **HTTP server** -- `HoneypotHTTPServer(ThreadingHTTPServer)` (adds a `threading.BoundedSemaphore(MAX_CONCURRENT_CONNECTIONS)` acquired in an overridden `process_request()` and released in an overridden `process_request_thread()`, so more than `MAX_CONCURRENT_CONNECTIONS` simultaneous connections are refused (socket closed immediately, no thread spun up, no response, no log line -- this remains one of the two structurally-accepted unlogged cases, see § Data Flow) `[SEC-1]`. `ThreadingHTTPServer` already sets `daemon_threads = True` by default (confirmed against the stdlib source), so the process can still exit cleanly even if a handler thread is stuck; no change needed there.
-- **HTTP handler** -- `HoneypotRequestHandler(BaseHTTPRequestHandler)` with class attribute `timeout = SOCKET_TIMEOUT_SECONDS` (stdlib's `socketserver.StreamRequestHandler.setup()` automatically applies this as a socket-level read timeout on every connection -- the slowloris mitigation `[RN-8] [SEC-1]`). Implements `do_GET`, `do_POST`, `do_PUT`, `do_PATCH`, `do_DELETE`, `do_HEAD`, `do_OPTIONS`, each a one-line call to the shared `_handle_request(self, http_method)`. This method owns: path check (`/mcp` vs. 404), HTTP-method check (`POST` vs. 405 with `Allow: POST`), body framing classification (`Content-Length` present/absent/duplicate/oversized, or `Transfer-Encoding: chunked` -- see § Data Flow, four distinct outcomes and status codes `[RN2-3] [RN2-4]`), body read with `errors="replace"` decoding, JSON parse attempt, top-level shape validation, building the `RequestContext`, calling `dispatch()`, calling the logging core (fault-tolerant), and writing the HTTP response via `_send_response`, which also sets `self._response_sent = True` immediately after the write completes `[RN2-5]`. The entire `_handle_request` method body is wrapped in one outer `try/except Exception` with an `_emergency_fallback()` path `[RN-6] [SEC-3]` -- see § Data Flow for the exact lifecycle. **New in Round 2 -- `log_error` override:** `HoneypotRequestHandler` also overrides `log_error(self, format, *args)`, the stdlib's single internal hook that fires for every pre-`do_*` rejection (malformed/oversized request line, unsupported HTTP version, oversized headers, an unimplemented HTTP verb, or a stall before any request line arrives). The override builds and writes a `build_stdlib_rejection_record(...)` through the same `log_writer` before delegating to `super().log_error(...)` so the stdlib's own stderr diagnostic line is preserved unchanged `[RN2-1]`. Full mechanism and the resulting, now-precise list of what's still genuinely unlogged is in § Data Flow.
+- **HTTP server** -- `HoneypotHTTPServer(ThreadingHTTPServer)` (adds a `threading.BoundedSemaphore(MAX_CONCURRENT_CONNECTIONS)` acquired in an overridden `process_request()` and released in an overridden `process_request_thread()`, so more than `MAX_CONCURRENT_CONNECTIONS` simultaneous connections are refused (socket closed immediately, no thread spun up, no response, no log line -- this remains one of the structurally-unloggable cases named in § Data Flow's now three-item "what's covered and what genuinely isn't" list) `[SEC-1]`. `ThreadingHTTPServer` already sets `daemon_threads = True` by default (confirmed against the stdlib source), so the process can still exit cleanly even if a handler thread is stuck; no change needed there.
+- **HTTP handler** -- `HoneypotRequestHandler(BaseHTTPRequestHandler)` with class attribute `timeout = SOCKET_TIMEOUT_SECONDS` (stdlib's `socketserver.StreamRequestHandler.setup()` automatically applies this as a socket-level read timeout on every connection -- the slowloris mitigation `[RN-8] [SEC-1]`). Implements `do_GET`, `do_POST`, `do_PUT`, `do_PATCH`, `do_DELETE`, `do_HEAD`, `do_OPTIONS`, each a one-line call to the shared `_handle_request(self, http_method)`. This method owns: path check (`/mcp` vs. 404), HTTP-method check (`POST` vs. 405 with `Allow: POST`), body framing classification (`Content-Length` present/absent/duplicate/oversized, or `Transfer-Encoding: chunked` -- see § Data Flow, five distinct outcomes and status codes `[RN2-3] [RN2-4] [RN3-2]`), body read with `errors="replace"` decoding, JSON parse attempt, top-level shape validation, building the `RequestContext`, calling `dispatch()`, calling the logging core (fault-tolerant), and writing the HTTP response via `_send_response`, which also sets `self._response_sent = True` immediately after the write completes `[RN2-5]`. The entire `_handle_request` method body is wrapped in one outer `try/except Exception` with an `_emergency_fallback()` path `[RN-6] [SEC-3]` -- see § Data Flow for the exact lifecycle. **New in Round 2 -- `log_error` override:** `HoneypotRequestHandler` also overrides `log_error(self, format, *args)`, the stdlib's single internal hook that fires for every pre-`do_*` rejection (malformed/oversized request line, unsupported HTTP version, oversized headers, an unimplemented HTTP verb, or a stall before any request line arrives). The override builds and writes a `build_stdlib_rejection_record(...)` through the same `log_writer` before delegating to `super().log_error(...)` so the stdlib's own stderr diagnostic line is preserved unchanged `[RN2-1]`. Full mechanism and the resulting, now-precise list of what's still genuinely unlogged is in § Data Flow. **New in Round 3 -- defensive hardening of `log_error`, plus a `handle_one_request` override:** `log_error()`'s entire body (not just the `log_writer.write()` call) is now wrapped in one `try/except Exception: pass`, so a failure anywhere in `build_stdlib_rejection_record`/`headers_to_dict`/the `format % args` formatting can never prevent `super().log_error(...)` from running or leak an unsanitized traceback to stderr via `socketserver`'s generic `handle_error()` `[SEC3-a]`. Separately, `HoneypotRequestHandler` also overrides `handle_one_request()` itself (a near-verbatim copy of the stdlib version with one inserted check) to catch the one case `log_error()` structurally cannot see -- a blank/whitespace-only first request line, where `parse_request()` returns `False` without calling `send_error()`/`log_error()` at all `[RN3-1]`. A new module-level constant, `MAX_LEADING_BLANK_REQUEST_LINES = 5`, bounds how many consecutive leading blank lines this override will log-and-skip before giving up and falling through to the stdlib's original (silent) behavior for that connection, so the fix itself can't become an unbounded per-connection read/log loop. Full mechanism in § Data Flow, "Universal logging via a `handle_one_request` override."
 - **Session store** -- module-level `SESSIONS: OrderedDict[str, dict]` (insertion-ordered so the oldest entry is always `next(iter(SESSIONS))`) + `SESSIONS_LOCK: threading.Lock`, written to only from inside `dispatch()` when a `method == "initialize"` call succeeds: a new `uuid.uuid4().hex` id is minted, and if `len(SESSIONS) >= MAX_SESSIONS` the oldest entry is evicted (`SESSIONS.popitem(last=False)`) before the new one is inserted, all under `SESSIONS_LOCK` `[SEC-2]`. **v1 does not attempt to correlate header-less follow-up requests back to a previously-issued session** -- `RequestContext.session_id` is populated strictly from the `Mcp-Session-Id` request header when present, `None` otherwise, with no IP-based or other fallback lookup `[RN-5]`.
 - **JSON-RPC dispatch** -- `dispatch(msg: dict, ctx: RequestContext) -> DispatchResult` (see exact signature in § Data Flow), a `METHODS: dict[str, Callable]` table, and one handler function per method: `handle_initialize`, `handle_notifications_initialized`, `handle_ping`, `handle_tools_list`, `handle_tools_call`. Wrapped in one `try/except InvalidParamsError` (→ `-32602`, `[RN-3]`) then `except Exception` (→ `-32603`) inside `dispatch()` itself, so *any* handler bug or bad-params condition becomes a well-formed JSON-RPC error object, never an unhandled exception reaching the transport layer.
 - **Fake tool catalog** -- `TOOLS: list[dict]` (the four `tools/list` entries: name, description, `inputSchema`) and `TOOL_HANDLERS: dict[str, Callable[[dict], dict]]` mapping tool name to a pure function that builds the fake `tools/call` result content. `validate_arguments(schema: dict, arguments: dict) -> None` (pure function, raises `InvalidParamsError`) checks arguments against each tool's `inputSchema` before its handler runs. **Round 2 fix `[RN2-2]`:** the `"integer"`/`"number"` type checks now explicitly exclude `bool` (`isinstance(value, bool)` is checked *before*, and takes precedence over, `isinstance(value, int)`), since Python's `bool` is a subclass of `int` and would otherwise let a JSON `true`/`false` incorrectly satisfy an `"integer"`/`"number"` schema field -- see exact logic in § Data Flow. No tool handler imports or calls anything from `os`, `subprocess`, `socket`, `urllib`, `builtins.eval`, `builtins.exec`, or `importlib`/dynamic `import`.
-- **README.md** (existing file at repo root, extended not replaced) -- gets the run/log-location/client-pointing paragraph the plan calls for, plus explicit caveats about unbounded JSONL growth, the read-timeout/connection-cap mitigations and their limits (including the accepted per-read-vs-total-duration tradeoff `[SEC2-a]`), and the now-precise two-item list of structurally-unlogged cases (see Task 4).
+- **README.md** (existing file at repo root, extended not replaced) -- gets the run/log-location/client-pointing paragraph the plan calls for, plus explicit caveats about unbounded JSONL growth (including that rejected/malformed traffic now contributes to it too, new in Round 3 `[SEC3-b]`), the read-timeout/connection-cap mitigations and their limits (including the accepted per-read-vs-total-duration tradeoff `[SEC2-a]`), and the now-precise three-item list of what remains unlogged -- two genuinely structurally-unloggable cases plus one bounded-by-design residual (see Task 4).
 - **.gitignore** (existing file at repo root) -- gains a `/honeypot.jsonl` entry; the current `.gitignore` already has a `# Python` section (`__pycache__/`, `*.py[cod]`, `.venv/`, etc.) but no honeypot-specific log entry, so this is a one-line addition, not a new section.
 
 ## Data Flow / Interfaces
@@ -76,15 +76,20 @@ socket bytes
            elif http_method != "POST":
                http_status = 405                  # empty body, Allow: POST header, no JSON-RPC body
            else:
-               outcome, length = _classify_content_length(self.headers)   # [RN2-3][RN2-4]: see below --
-                                                                            # "ok" | "chunked" | "duplicate"
-                                                                            # | "missing_or_invalid"
+               outcome, length = _classify_content_length(self.headers)   # [RN2-3][RN2-4][RN3-2]: see below --
+                                                                            # "ok" | "chunked" |
+                                                                            # "duplicate_content_length" |
+                                                                            # "duplicate_transfer_encoding" |
+                                                                            # "missing_or_invalid"
                if outcome == "chunked":
                    http_status = 411               # Transfer-Encoding: chunked -- not supported in v1
                    raw_body = "(Transfer-Encoding: chunked not supported)"
-               elif outcome == "duplicate":
+               elif outcome == "duplicate_content_length":
                    http_status = 400               # >1 Content-Length header -- ambiguous, rejected outright
                    raw_body = "(duplicate Content-Length headers)"
+               elif outcome == "duplicate_transfer_encoding":
+                   http_status = 400               # >1 Transfer-Encoding header -- same ambiguity, rejected
+                   raw_body = "(duplicate Transfer-Encoding headers)"     # outright regardless of agreement [RN3-2]
                elif outcome == "missing_or_invalid":
                    http_status = 413               # absent / non-numeric / negative / over MAX_BODY_BYTES
                    raw_body = "(missing, invalid, or oversized Content-Length)"
@@ -219,70 +224,209 @@ def log_error(self, format: str, *args) -> None:
     record + stderr line, built from whatever partial request-line state
     the stdlib had already captured -- self.command/self.path/self.headers
     may be None, '', or not-yet-set, so every field access here is
-    defensive -- before delegating to super().log_error(...) so the
-    stdlib's own operator-facing stderr line is preserved unchanged."""
-    detail = format % args
-    record = build_stdlib_rejection_record(
-        client_ip=self.client_address[0],
-        client_port=self.client_address[1],
-        http_method=getattr(self, "command", None) or None,
-        path=getattr(self, "path", None) or None,
-        headers=headers_to_dict(self.headers) if getattr(self, "headers", None) else {},
-        detail=detail,
-    )
+    defensive.
+
+    [SEC3-a, Round 3] The ENTIRE body below is wrapped in one
+    try/except Exception: pass, mirroring _handle_request's own
+    outer-try-except pattern, rather than only wrapping the
+    log_writer.write() call as in the Round 2 version. A bug anywhere in
+    build_stdlib_rejection_record()/headers_to_dict()/the `format % args`
+    formatting can therefore never prevent super().log_error(...) from
+    running (which would otherwise silently drop the stdlib's own
+    operator-facing diagnostic line), and can never escape into
+    socketserver's generic handle_error(), which prints an UNSANITIZED
+    traceback straight to stderr -- bypassing sanitize_for_stderr
+    entirely, on a code path where `detail`/the request line can contain
+    attacker-controlled bytes. super().log_error(...) is called
+    unconditionally afterward, outside the try, so it always fires
+    exactly once regardless of what happens above it."""
     try:
-        log_writer.write(record)          # same lock-guarded writer as every other call site
-    except Exception as log_err:
-        sys.stderr.write(f"[honeypot] WARNING: log write failed: {sanitize_for_stderr(repr(log_err))}\n")
-    emit_stderr_summary(record)
+        detail = format % args
+        record = build_stdlib_rejection_record(
+            client_ip=self.client_address[0],
+            client_port=self.client_address[1],
+            http_method=getattr(self, "command", None) or None,
+            path=getattr(self, "path", None) or None,
+            headers=headers_to_dict(self.headers) if getattr(self, "headers", None) else {},
+            detail=detail,
+        )
+        try:
+            log_writer.write(record)          # same lock-guarded writer as every other call site
+        except Exception as log_err:
+            sys.stderr.write(f"[honeypot] WARNING: log write failed: {sanitize_for_stderr(repr(log_err))}\n")
+        emit_stderr_summary(record)
+    except Exception:
+        pass
     super().log_error(format, *args)
 ```
 
 This override does **not** interfere with normal-request logging: `_handle_request` never calls `self.send_error()` or `self.log_error()` on any of its own paths (404/405/411/400/413/200/202 are all built and sent via the honeypot's own `_send_response`), so there is no double-logging between the two mechanisms. It also, as a side effect, means Round 1's exception (1) (unimplemented HTTP verbs) is **no longer an exception at all** -- it is captured by this same override, since `handle_one_request()` routes it through `send_error(501)` → `log_error(...)` exactly like the other cases.
 
-**Universal logging: what's covered and what genuinely isn't.** After this change, exactly **two** cases remain structurally unlogged -- both are cases where, unlike everything above, no stdlib hook fires at all (no exception, no `log_error` call, nothing to intercept short of instrumenting raw socket reads at a much lower level than this design's scope justifies):
+**Universal logging via a `handle_one_request` override, closing the blank-request-line gap (new in Round 3) `[RN3-1]`:**
 
-1. **Connections refused at the `MAX_CONCURRENT_CONNECTIONS` semaphore cap.** `HoneypotHTTPServer.process_request` closes the socket immediately, before `handle_one_request` (and therefore before any of the above) ever runs. This is an accepted, unchanged-since-Round-1 `[SEC-1]` design choice: logging it would require adding a code path at the raw-`accept()` layer for a case that, by construction, never got far enough to exchange any HTTP-level data.
-2. **A client that opens a TCP connection and sends zero bytes before an ordinary clean close/reset (not a timeout).** `self.rfile.readline(65537)` simply returns `b''` on EOF; `handle_one_request()`'s response is `self.close_connection = True; return` -- no exception, no `send_error`, no `log_error` call. There is genuinely nothing to log here even in principle (not even a partial request line), short of instrumenting `rfile.readline` itself purely to detect "a TCP connection existed briefly," which was judged not worth the complexity for the near-zero forensic value of that signal on its own.
+Round 3 review verified the `log_error` fix above against live CPython 3.14 behavior rather than taking the design's own claims on faith, and found one case the fix cannot see: `parse_request()`'s very first branch,
 
-Both of these are now named precisely, not approximated, resolving Round 2's core objection to the "two named exceptions" framing -- the *content* of the list changed entirely (from two loggable-but-missed cases to two genuinely unloggable ones), even though the count is coincidentally still two.
+```python
+words = requestline.split()
+if len(words) == 0:
+    return False
+```
 
-**400 / 404 / 405 / 411 / 413 response shapes `[RN-9] [RN2-3] [RN2-4]`:** all five are empty-body HTTP responses (`Content-Length: 0`), no JSON-RPC envelope, matching plan.md's "Transport-level problems ... use HTTP status codes with no JSON-RPC body" -- duplicate/ambiguous `Content-Length` (400) and unsupported `Transfer-Encoding: chunked` (411) are both transport-level framing problems in exactly the same sense as an oversized body (413), so extending the same "status code, no body" treatment to them is consistent with, not a departure from, the plan's split. The 405 response additionally sets `Allow: POST`. None of the five set `Content-Type: application/json` since there is no body to type.
+fires for a blank or whitespace-only first request line (e.g. a bare `\r\n` sent before the real request line -- RFC 7230 SS3.5 explicitly recommends servers tolerate exactly this) and returns `False` **without calling `self.send_error()` or `self.log_error()` at all**. `handle_one_request()` then just `return`s on the strength of a comment ("An error code has been sent, just exit") that is false on this specific path. Verified empirically, not just by reading source: a bare `BaseHTTPRequestHandler` with a `log_error` override that prints on every call, sent a raw socket connection containing only `b"\r\n"`, produced zero response bytes and zero `log_error` calls. Practically, this means a client that (per RFC 7230's own leniency recommendation) sends one leading blank line before its actual request loses the **entire subsequent request** with zero trace, not just the blank line -- exactly the scanner/probe pattern this honeypot most wants to capture.
 
-**Duplicate/chunked `Content-Length` classification, exact logic `[RN2-3] [RN2-4]`:**
+`log_error()` cannot be the interception point for this case, since it is provably never called. Instead, `HoneypotRequestHandler` overrides `handle_one_request()` itself -- a near-verbatim reproduction of the stdlib version (reproduced here in full, since CPython doesn't factor the request-line read out into an independently overridable method), with exactly one inserted check. This override needs `HTTPStatus` in scope; add `from http import HTTPStatus` to the file's imports (see the updated stdlib module list in § Architecture Overview):
+
+```python
+def handle_one_request(self) -> None:
+    """Overrides BaseHTTPRequestHandler.handle_one_request() wholesale.
+    Identical to the stdlib version except for the ONE block marked
+    below, which detects and logs a blank/whitespace-only leading
+    request line before it reaches parse_request() -- the one case
+    log_error() structurally cannot observe (see above). Bounded to
+    MAX_LEADING_BLANK_REQUEST_LINES consecutive skips so a client can't
+    turn this into an unbounded per-connection read/log loop; each
+    skipped read is still bounded by SOCKET_TIMEOUT_SECONDS same as any
+    other read on this connection, so a stalling client between blank
+    lines is still caught by the existing except TimeoutError branch
+    below, unchanged."""
+    try:
+        blank_lines_skipped = 0
+        while True:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ''
+                self.request_version = ''
+                self.command = ''
+                self.send_error(HTTPStatus.REQUEST_URI_TOO_LONG)
+                return
+            if not self.raw_requestline:
+                self.close_connection = True
+                return
+            if (self.raw_requestline.strip()
+                    or blank_lines_skipped >= MAX_LEADING_BLANK_REQUEST_LINES):
+                break
+            # [RN3-1] blank/whitespace-only line where a request line was
+            # expected -- parse_request() would silently `return False`
+            # here with no send_error()/log_error() call at all. Log it
+            # ourselves, then loop to read the real request line, per
+            # RFC 7230 SS3.5's "SHOULD ignore" leading-CRLF guidance.
+            blank_lines_skipped += 1
+            self._log_blank_request_line()
+
+        if not self.parse_request():
+            # An error code has been sent, just exit
+            return
+        mname = 'do_' + self.command
+        if not hasattr(self, mname):
+            self.send_error(
+                HTTPStatus.NOT_IMPLEMENTED,
+                "Unsupported method (%r)" % self.command)
+            return
+        method = getattr(self, mname)
+        method()
+        self.wfile.flush()   # actually send the response if not already done.
+    except TimeoutError as e:
+        # a read or a write timed out.  Discard this connection
+        self.log_error("Request timed out: %r", e)
+        self.close_connection = True
+        return
+
+def _log_blank_request_line(self) -> None:
+    """Builds and writes a build_stdlib_rejection_record for a blank/
+    whitespace-only first request line -- the one case log_error() cannot
+    see. Wrapped entirely in its own try/except Exception: pass, same
+    defensive pattern as the Round 3 log_error() fix [SEC3-a], so a
+    failure here can never prevent handle_one_request() from continuing
+    on to read the real, following request line."""
+    try:
+        record = build_stdlib_rejection_record(
+            client_ip=self.client_address[0],
+            client_port=self.client_address[1],
+            http_method=None,
+            path=None,
+            headers={},
+            detail="blank request line (RFC 7230 SS3.5 leading CRLF tolerance)",
+        )
+        try:
+            log_writer.write(record)
+        except Exception as log_err:
+            sys.stderr.write(f"[honeypot] WARNING: log write failed: {sanitize_for_stderr(repr(log_err))}\n")
+        emit_stderr_summary(record)
+    except Exception:
+        pass
+```
+
+This does not double-log against `log_error()`: the blank-line case never reaches `parse_request()`/`send_error()`/`log_error()` in the first place (that's the entire bug being fixed), and every *other* rejection path (malformed line, oversized line, bad version, oversized headers, unimplemented verb, pre-request-line timeout) is completely unchanged by this override -- it falls straight through to the unmodified `parse_request()`/`send_error()`/`log_error()` chain exactly as in Round 2, so no case is logged twice.
+
+**Universal logging: what's covered and what genuinely isn't (updated, Round 3).** After the `log_error()` and `handle_one_request()` overrides above, exactly **two** cases remain genuinely structurally unloggable -- no stdlib hook fires at all, ever, regardless of how this code is written -- plus **one** further case that is deliberately *bounded by design* rather than eliminated outright:
+
+**Genuinely structurally unloggable (no hook exists, in principle, to intercept):**
+
+1. **Connections refused at the `MAX_CONCURRENT_CONNECTIONS` semaphore cap.** `HoneypotHTTPServer.process_request` closes the socket immediately, before `handle_one_request` (and therefore before any of the above, including the new blank-line check) ever runs. This is an accepted, unchanged-since-Round-1 `[SEC-1]` design choice: logging it would require adding a code path at the raw-`accept()` layer for a case that, by construction, never got far enough to exchange any HTTP-level data.
+2. **A client that opens a TCP connection and sends zero bytes before an ordinary clean close/reset (not a timeout).** `self.rfile.readline(65537)` simply returns `b''` on EOF; `handle_one_request()`'s response is `self.close_connection = True; return` -- no exception, no `send_error`, no `log_error` call, and (as of this revision) still no bytes for the new blank-line check to act on either, since it only fires once a non-empty line has actually been read. There is genuinely nothing to log here even in principle (not even a partial request line), short of instrumenting `rfile.readline` itself purely to detect "a TCP connection existed briefly," which was judged not worth the complexity for the near-zero forensic value of that signal on its own.
+
+**Bounded by design, not structurally impossible (new in Round 3):**
+
+3. **More than `MAX_LEADING_BLANK_REQUEST_LINES` (default 5) consecutive blank/whitespace-only leading lines before a real request line ever arrives.** Unlike cases 1 and 2, a hook *does* exist and *is* used here (`_log_blank_request_line()`) -- but only up to the bound, so this connection isn't turned into an unbounded per-connection read/log loop under attacker control. Once the bound is exhausted, `handle_one_request()`'s override falls through to the stdlib's own unmodified `parse_request()` call for that still-blank line, which silently returns `False` exactly as in the pre-fix (Round 2 and earlier) behavior -- so the *final* line in a run of more than `MAX_LEADING_BLANK_REQUEST_LINES` consecutive blank lines is unlogged, though every blank line up to the bound was logged individually. In practice this requires a client to send strictly more than five consecutive blank lines before ever sending a real request line -- meaningfully rarer than, and a deliberate superset of, the single-leading-CRLF pattern RFC 7230 SS3.5 actually recommends tolerating (which this fix fully and precisely resolves).
+
+These three items -- not two -- are the complete, current, and precisely-derived list of what remains unlogged after this revision; nothing else in `parse_request()`, `handle_one_request()`, or `handle_expect_100()` returns/exits without going through either `send_error()`/`log_error()` or one of the two genuinely-structural gaps above (re-verified against the CPython 3.14 stdlib source as part of this revision, per review-notes.md Round 3's specific charge to check this empirically rather than by re-assertion).
+
+**400 / 404 / 405 / 411 / 413 response shapes `[RN-9] [RN2-3] [RN2-4] [RN3-2]`:** all five are empty-body HTTP responses (`Content-Length: 0`), no JSON-RPC envelope, matching plan.md's "Transport-level problems ... use HTTP status codes with no JSON-RPC body" -- duplicate/ambiguous `Content-Length` (400), duplicate `Transfer-Encoding` (400, same treatment for the same reason, as of this revision `[RN3-2]`), and unsupported `Transfer-Encoding: chunked` (411) are all transport-level framing problems in exactly the same sense as an oversized body (413), so extending the same "status code, no body" treatment to them is consistent with, not a departure from, the plan's split. The 405 response additionally sets `Allow: POST`. None of the five set `Content-Type: application/json` since there is no body to type.
+
+**Duplicate/chunked `Content-Length`/`Transfer-Encoding` classification, exact logic `[RN2-3] [RN2-4] [RN3-2]`:**
 
 ```python
 def _classify_content_length(
     headers: email.message.Message, max_body_bytes: int = MAX_BODY_BYTES
 ) -> tuple[str, int | None]:
     """Pure function over a parsed header set. Returns (outcome, length):
-      ("ok", N)                    -- exactly one Content-Length header, a valid
-                                       non-negative base-10 integer, N <= max_body_bytes.
-      ("chunked", None)            -- a Transfer-Encoding header is present with any
-                                       value other than "identity" (case-insensitive) --
-                                       v1 has no chunked-decoding support at all. Checked
-                                       BEFORE Content-Length, so a request that illegally
-                                       sends both is still classified as chunked, per
-                                       RFC 7230 SS3.3.3's guidance that Transfer-Encoding
-                                       takes precedence when both are present.
-      ("duplicate", None)          -- more than one Content-Length header (checked via
-                                       headers.get_all("Content-Length"), since
-                                       headers.get(...) on email.message.Message silently
-                                       returns only the first occurrence) -- rejected
-                                       outright as ambiguous per RFC 7230 SS3.3.2, regardless
-                                       of whether the repeated values happen to agree.
-      ("missing_or_invalid", None) -- zero Content-Length headers, or the single value
-                                       present isn't a valid non-negative base-10 integer,
-                                       or it exceeds max_body_bytes.
+      ("ok", N)                          -- exactly one Content-Length header, a valid
+                                             non-negative base-10 integer, N <= max_body_bytes,
+                                             and Transfer-Encoding is absent or a single
+                                             "identity" occurrence.
+      ("chunked", None)                  -- exactly one Transfer-Encoding header present with
+                                             a value other than "identity" (case-insensitive) --
+                                             v1 has no chunked-decoding support at all. Checked
+                                             BEFORE Content-Length, so a request that illegally
+                                             sends both is still classified by Transfer-Encoding,
+                                             per RFC 7230 SS3.3.3's guidance that Transfer-Encoding
+                                             takes precedence when both are present.
+      ("duplicate_transfer_encoding", None)
+                                          -- [RN3-2] more than one Transfer-Encoding header
+                                             (checked via headers.get_all("Transfer-Encoding"),
+                                             the same fix already applied to Content-Length in
+                                             Round 2 -- headers.get(...) on email.message.Message
+                                             silently returns only the FIRST occurrence, which
+                                             would let a "Transfer-Encoding: identity" followed by
+                                             a second "Transfer-Encoding: chunked" header slip
+                                             through misclassified as non-chunked). Rejected
+                                             outright as ambiguous, the same policy already
+                                             applied to duplicate Content-Length, regardless of
+                                             whether the repeated values happen to agree.
+      ("duplicate_content_length", None) -- more than one Content-Length header (checked via
+                                             headers.get_all("Content-Length")) -- rejected
+                                             outright as ambiguous per RFC 7230 SS3.3.2, regardless
+                                             of whether the repeated values happen to agree.
+      ("missing_or_invalid", None)       -- zero Content-Length headers, or the single value
+                                             present isn't a valid non-negative base-10 integer,
+                                             or it exceeds max_body_bytes.
+
+    Checked in this order: Transfer-Encoding duplicates, then Transfer-Encoding value,
+    then Content-Length duplicates, then Content-Length value -- duplicate-detection always
+    precedes single-value interpretation for BOTH headers, consistent by construction.
     """
-    if headers.get("Transfer-Encoding", "").strip().lower() not in ("", "identity"):
+    te_values = headers.get_all("Transfer-Encoding") or []
+    if len(te_values) > 1:
+        return ("duplicate_transfer_encoding", None)
+    if len(te_values) == 1 and te_values[0].strip().lower() not in ("", "identity"):
         return ("chunked", None)
-    values = headers.get_all("Content-Length") or []
-    if len(values) > 1:
-        return ("duplicate", None)
-    if len(values) == 0:
+
+    cl_values = headers.get_all("Content-Length") or []
+    if len(cl_values) > 1:
+        return ("duplicate_content_length", None)
+    if len(cl_values) == 0:
         return ("missing_or_invalid", None)
-    raw = values[0].strip()
+    raw = cl_values[0].strip()
     if not raw.isdigit():
         return ("missing_or_invalid", None)
     length = int(raw)
@@ -400,7 +544,7 @@ def _classify_content_length(headers: email.message.Message, max_body_bytes: int
 
 **Log record shape** (one JSON object per line, per plan, covering every HTTP request that reaches `_handle_request`): `ts` (ISO 8601 UTC), `client_ip`, `client_port`, `http_method` (`"GET"`/`"POST"`/etc.), `path` (e.g. `"/mcp"`, `"/"`), `headers` (dict, values as opaque strings, duplicates comma-joined), `session_id` (string or `null`), `raw_body` (decoded with `errors="replace"`, or `null` for verb/path rejections where no body was read, or one of the distinct marker strings above for 411/400/413 -- never buffered in full when over cap), `method` (parsed JSON-RPC `method` or `null`), `tool_name` / `tool_arguments` (populated only when `method == "tools/call"`, taken from the *parsed* request params, not from the tool handler's output), `response` (the exact JSON-RPC body sent, `null` for 404/405/411/400/413, or `"202 Accepted (notification)"` for notifications), `http_status` (int), `internal_fault` (bool, `true` only on records built by `_emergency_fallback`, absent/`false` otherwise).
 
-**Stdlib-rejection log record shape** (new in Round 2, built by `build_stdlib_rejection_record` and written from the `log_error` override -- a distinct, narrower shape from the one above, since most `_handle_request`-only fields don't exist yet at this point in request handling): `ts`, `client_ip`, `client_port`, `http_method` (may be `null` if the request line never parsed as `METHOD PATH VERSION` at all), `path` (may be `null`, same reason), `headers` (`{}` if header parsing was never reached), `session_id: null`, `raw_body: null` (body-reading is never reached for any case this hook covers), `method: null`, `response: null`, `http_status: null` (the stdlib's own status code isn't reliably recoverable from inside `log_error`; the human-readable `detail` string below names it instead, e.g. `"code 400, message Bad request syntax (...)"` or `"Request timed out: ..."`), `stdlib_rejection: true` (distinguishes this narrower record shape from a normal `_handle_request` record at a glance), `detail` (the exact `format % args` string passed to `log_error`).
+**Stdlib-rejection log record shape** (new in Round 2, built by `build_stdlib_rejection_record` and written from both the `log_error` override and (new in Round 3) the `handle_one_request` override's `_log_blank_request_line()` helper -- a distinct, narrower shape from the one above, since most `_handle_request`-only fields don't exist yet at this point in request handling): `ts`, `client_ip`, `client_port`, `http_method` (may be `null` if the request line never parsed as `METHOD PATH VERSION` at all -- always `null` for the blank-request-line case), `path` (may be `null`, same reason), `headers` (`{}` if header parsing was never reached), `session_id: null`, `raw_body: null` (body-reading is never reached for any case this hook covers), `method: null`, `response: null`, `http_status: null` (the stdlib's own status code isn't reliably recoverable from inside `log_error`; the human-readable `detail` string below names it instead, e.g. `"code 400, message Bad request syntax (...)"`, `"Request timed out: ..."`, or `"blank request line (RFC 7230 SS3.5 leading CRLF tolerance)"`), `stdlib_rejection: true` (distinguishes this narrower record shape from a normal `_handle_request` record at a glance), `detail` (the exact `format % args` string passed to `log_error`, or the fixed blank-line description for the `handle_one_request` override's own call site).
 
 **`initialize` result shape:** `{"protocolVersion": "2025-06-18", "serverInfo": {"name": "<honeypot's advertised name>", "version": "1.0.0"}, "capabilities": {"tools": {}}}`. `2025-06-18` is the design's chosen protocol-version string (most recent MCP spec revision date at design time) per the plan's Open Question; the honeypot advertises it unconditionally regardless of what the client requested, since the goal is to log the handshake attempt, not to negotiate correctly.
 
@@ -452,10 +596,11 @@ class HoneypotRequestHandler(BaseHTTPRequestHandler):
   2. **Protocol logic is separable from I/O.** `dispatch(msg, ctx)` and every `handle_*`/`TOOL_HANDLERS[...]` function take plain dicts/dataclasses and return plain dicts/`DispatchResult` -- no `self.rfile`/`self.wfile`, no file handle, no network. A test (or a human at a REPL) can call `dispatch({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {...}}, RequestContext(...))` directly and assert on the returned `DispatchResult` with no server running.
 - **`build_log_record`, `build_stdlib_rejection_record`, `sanitize_for_stderr`, `headers_to_dict`, `_classify_content_length`, and `validate_arguments` are pure functions** over their inputs -- straightforward to test with adversarial strings (newlines, ANSI escapes, huge values, duplicate header names, malformed/wrongly-typed tool arguments, `email.message.Message` objects with repeated `Content-Length`/`Transfer-Encoding` headers) without touching the filesystem or a running server.
 - **`validate_arguments`'s bool-exclusion fix is directly testable** `[RN2-2]`: calling it with a schema declaring `{"type": "integer"}` and an `arguments` value of `True`/`False` must raise `InvalidParamsError`; the same schema with an actual `int` (including `0`/`1`, which are the values most likely to be mistaken for bools) must not raise.
-- **`_classify_content_length` is directly testable without a socket** `[RN2-3] [RN2-4]`: construct an `email.message.Message`, call `.add_header("Content-Length", "10")` twice to get a duplicate, or `.add_header("Transfer-Encoding", "chunked")`, and assert the returned `(outcome, length)` tuple for each of the four branches.
+- **`_classify_content_length` is directly testable without a socket** `[RN2-3] [RN2-4] [RN3-2]`: construct an `email.message.Message`, call `.add_header("Content-Length", "10")` twice to get a duplicate, call `.add_header("Transfer-Encoding", "identity")` then `.add_header("Transfer-Encoding", "chunked")` to get a duplicate Transfer-Encoding (asserting it returns `"duplicate_transfer_encoding"`, not `"chunked"` or `"ok"`, confirming `.get_all()` rather than `.get()` is actually being used), or a single `.add_header("Transfer-Encoding", "chunked")`, and assert the returned `(outcome, length)` tuple for each of the five branches.
 - **`-32600`/`-32602` coverage is a pure-function concern.** Non-dict top-level JSON (`42`, `"x"`, `[1,2,3]`, `true`) and missing/wrong-typed `tools/call` arguments can both be exercised without a running server: the former by calling `_handle_request`'s shape-check logic directly (or, if extracted, a standalone `classify_top_level(parsed) -> "ok" | "invalid_request"` helper), the latter by calling `handle_tools_call(params, ctx)` and asserting `InvalidParamsError` is raised.
 - **The log-write failure path is testable via monkeypatching.** Since `log_writer.write` is a single method call site inside `_handle_request` (and the `log_error` override, and `_emergency_fallback` -- all three call the *same* instance), a test can substitute a `JSONLogWriter`-like object whose `write()` raises, and assert (a) the HTTP response/behavior on each of those three paths is still correct and (b) a `[honeypot] WARNING: log write failed` line appears on stderr each time.
-- **The `log_error` override is testable in two ways `[RN2-1]`:** (a) directly -- instantiate a `HoneypotRequestHandler`-like object with a stubbed `client_address`/`command`/`path`/`headers`, call `.log_error("code %d, message %s", 400, "Bad request syntax")` on it, and assert `build_stdlib_rejection_record` was called with the right fields and `log_writer.write` received a record with `stdlib_rejection: true`; (b) end-to-end -- open a raw `socket.socket()` against the running server and send bytes that don't parse as an HTTP request line (e.g. `b"not an http request at all\r\n\r\n"`), or a request line over 65536 bytes, or nothing at all for longer than `SOCKET_TIMEOUT_SECONDS`, and assert `honeypot.jsonl` gains one `stdlib_rejection: true` line each time.
+- **The `log_error` override is testable in three ways `[RN2-1] [SEC3-a]`:** (a) directly -- instantiate a `HoneypotRequestHandler`-like object with a stubbed `client_address`/`command`/`path`/`headers`, call `.log_error("code %d, message %s", 400, "Bad request syntax")` on it, and assert `build_stdlib_rejection_record` was called with the right fields and `log_writer.write` received a record with `stdlib_rejection: true`; (b) end-to-end -- open a raw `socket.socket()` against the running server and send bytes that don't parse as an HTTP request line (e.g. `b"not an http request at all\r\n\r\n"`), or a request line over 65536 bytes, or nothing at all for longer than `SOCKET_TIMEOUT_SECONDS`, and assert `honeypot.jsonl` gains one `stdlib_rejection: true` line each time; (c) **new `[SEC3-a]`** -- monkeypatch `build_stdlib_rejection_record` (or `headers_to_dict`) to raise, call `.log_error(...)` directly, and assert `super().log_error(...)`'s effect (the stdlib's own stderr diagnostic) still occurs and no unsanitized exception/traceback reaches stderr -- confirms the full-body `try/except` wrap actually prevents a broken custom-logic path from suppressing the stdlib's own error response.
+- **The `handle_one_request` blank-request-line fix is testable end-to-end `[RN3-1]`:** open a raw socket against the running server, send `b"\r\n"` immediately followed by a real, well-formed request line + headers + body on the *same* connection, and assert (a) `honeypot.jsonl` gains one `stdlib_rejection: true` record with `detail` naming the blank line, AND (b) a second, normal record for the real request that follows -- confirming the request is no longer silently dropped. A companion test sending `MAX_LEADING_BLANK_REQUEST_LINES + 1` consecutive blank lines before any real request line should observe exactly `MAX_LEADING_BLANK_REQUEST_LINES` logged blank-line records followed by the connection closing with no further record for the final (bound-exceeding) blank line -- the one documented, bounded-by-design residual gap (see § Data Flow).
 - **The emergency-fallback path is testable by forcing an exception upstream of dispatch**, e.g. monkeypatching `self.rfile.read` to raise, and asserting the handler still returns *some* HTTP response, `self._response_sent` ends up `True`, and the process doesn't crash.
 - **Response-sent double-send/zero-send regressions are directly testable `[RN2-5]`:** monkeypatch `_send_response` to raise partway through (after starting to write headers but before completing), call `_handle_request`, and assert `_emergency_fallback` still attempts (and that the test can observe) exactly one attempted response -- not two, not zero.
 - **End-to-end smoke testing** (manual or QA-added) is straightforward via stdlib `http.client` or `curl` against `127.0.0.1:<port>` since the transport is plain HTTP/JSON -- no SSE, no auth, no TLS to negotiate.
@@ -467,15 +612,16 @@ class HoneypotRequestHandler(BaseHTTPRequestHandler):
 
 1. **HTTP server, universal request lifecycle (including stdlib-rejection logging), and logging core.** Create `mcp_honeypot.py` at the repo root with:
    - `build_arg_parser`/`main` (CLI flags `--host` 127.0.0.1, `--port` 8000, `--log-file` ./honeypot.jsonl, all side effects gated behind `if __name__ == "__main__":`); no additional CLI flags.
-   - Module-level constants `MAX_BODY_BYTES = 1_048_576`, `SOCKET_TIMEOUT_SECONDS = 10`, `MAX_CONCURRENT_CONNECTIONS = 200`, `MAX_SESSIONS = 10_000` (the last one is wired in Task 2, but declare it here alongside the others).
+   - Module-level constants `MAX_BODY_BYTES = 1_048_576`, `SOCKET_TIMEOUT_SECONDS = 10`, `MAX_CONCURRENT_CONNECTIONS = 200`, `MAX_SESSIONS = 10_000` (the last one is wired in Task 2, but declare it here alongside the others), `MAX_LEADING_BLANK_REQUEST_LINES = 5` (new in Round 3, wired into the `handle_one_request` override below `[RN3-1]`).
    - `HoneypotHTTPServer(ThreadingHTTPServer)` with the `BoundedSemaphore`-based connection cap (`process_request`/`process_request_thread` overrides, exactly as specified in § Data Flow).
    - `HoneypotRequestHandler(BaseHTTPRequestHandler)` with `timeout = SOCKET_TIMEOUT_SECONDS`, and `do_GET`/`do_POST`/`do_PUT`/`do_PATCH`/`do_DELETE`/`do_HEAD`/`do_OPTIONS` all delegating to one shared `_handle_request(self, http_method: str)`.
-   - `_handle_request` implementing the full lifecycle from § Data Flow: `self._response_sent = False` set first; path check (non-`/mcp` → 404, empty body); method check (`/mcp` + non-`POST` → 405, empty body, `Allow: POST`); `_classify_content_length(self.headers)` four-way branch (`"ok"` → read+decode body; `"chunked"` → 411 with its distinct marker `[RN2-3]`; `"duplicate"` → 400 with its distinct marker `[RN2-4]`; `"missing_or_invalid"` → 413 with its distinct marker); UTF-8 decode with `errors="replace"`; `json.loads` attempt producing `parsed: object | None`; a shape check that runs `isinstance(parsed, dict) and isinstance(parsed.get("method"), str)` **before** any dict-only operation on `parsed`, routing non-conforming-but-valid JSON to a `-32600 Invalid Request` response built directly (not via `dispatch()`); `RequestContext` dataclass; `headers_to_dict` (duplicate headers comma-joined).
+   - `_handle_request` implementing the full lifecycle from § Data Flow: `self._response_sent = False` set first; path check (non-`/mcp` -> 404, empty body); method check (`/mcp` + non-`POST` -> 405, empty body, `Allow: POST`); `_classify_content_length(self.headers)` five-way branch (`"ok"` -> read+decode body; `"chunked"` -> 411 with its distinct marker `[RN2-3]`; `"duplicate_content_length"` -> 400 with its distinct marker `[RN2-4]`; `"duplicate_transfer_encoding"` -> 400 with its own distinct marker, same treatment as duplicate Content-Length `[RN3-2]`; `"missing_or_invalid"` -> 413 with its distinct marker); UTF-8 decode with `errors="replace"`; `json.loads` attempt producing `parsed: object | None`; a shape check that runs `isinstance(parsed, dict) and isinstance(parsed.get("method"), str)` **before** any dict-only operation on `parsed`, routing non-conforming-but-valid JSON to a `-32600 Invalid Request` response built directly (not via `dispatch()`); `RequestContext` dataclass; `headers_to_dict` (duplicate headers comma-joined).
    - `dispatch()` as a stub in this task only (always returns `DispatchResult(response=_build_error(..., -32601, "Method not found"), session_id=None)` for any method, or the `-32700`/`-32600` paths handled above it) -- full method table lands in Task 2, but `_handle_request` must already call `dispatch()` with its final signature (`msg: dict, ctx: RequestContext) -> DispatchResult`) so Task 2 doesn't have to touch the transport layer.
    - `JSONLogWriter` (single file handle opened once in `main()`, `threading.Lock`-guarded `write()` that appends one `json.dumps(record) + "\n"` and flushes before returning; this is the **one and only** instance that `_handle_request`, the `log_error` override, and `_emergency_fallback` all write through `[SEC2-c]`); `build_log_record` (including `http_method`/`path`/`internal_fault` fields); `build_stdlib_rejection_record` (new, per § Data Flow); `sanitize_for_stderr` (strips `[\x00-\x1f\x7f]` control chars, truncates to a bounded length); `emit_stderr_summary`.
    - The log-then-respond glue: build `response_obj` → `build_log_record` → `log_writer.write(record)` wrapped in its own local `try/except Exception` (on failure, print a `[honeypot] WARNING: log write failed: ...` sanitized stderr line, then continue) → `emit_stderr_summary(record)` → `_send_response(...)` which sets `self._response_sent = True` immediately after its write completes `[RN2-5]`.
    - One outer `try/except Exception` wrapping the *entire* `_handle_request` body (context build through response send), with `_emergency_fallback(self, http_method)` as the except-branch handler: checks `self._response_sent` before attempting its own send (setting it `True` only after that send succeeds), writes its best-effort record through the *same* `log_writer`, and writes a plain stderr line -- each of the three independently wrapped in its own `try/except Exception: pass`, exactly as specified in § Data Flow.
-   - **New `[RN2-1]`:** override `log_error(self, format: str, *args) -> None` on `HoneypotRequestHandler` exactly as specified in § Data Flow ("Universal logging via a `log_error` override") -- builds and writes a `build_stdlib_rejection_record(...)` through `log_writer`, calls `emit_stderr_summary`, then delegates to `super().log_error(format, *args)`.
+   - override `log_error(self, format: str, *args) -> None` on `HoneypotRequestHandler` exactly as specified in § Data Flow ("Universal logging via a `log_error` override") -- builds and writes a `build_stdlib_rejection_record(...)` through `log_writer`, calls `emit_stderr_summary`, then delegates to `super().log_error(format, *args)` `[RN2-1]`. **New in Round 3:** the entire body of `log_error()` (not just the `log_writer.write()` call) is wrapped in one `try/except Exception: pass`, so `super().log_error(...)` always runs regardless of what fails above it `[SEC3-a]`.
+   - **New in Round 3 `[RN3-1]`:** override `handle_one_request(self) -> None` on `HoneypotRequestHandler` and add a private `_log_blank_request_line(self) -> None` helper, exactly as specified in § Data Flow ("Universal logging via a `handle_one_request` override") -- catches the one case `log_error()` structurally cannot see (a blank/whitespace-only first request line), logs it, and loops to read the real request line, bounded by `MAX_LEADING_BLANK_REQUEST_LINES`. Requires adding `from http import HTTPStatus` to the file's imports (see updated stdlib module list in § Architecture Overview).
    - Add `/honeypot.jsonl` to `.gitignore` (repo root, next to the existing `# Python` section).
 
    **Acceptance:**
@@ -488,11 +634,15 @@ class HoneypotRequestHandler(BaseHTTPRequestHandler):
    - A body larger than `MAX_BODY_BYTES` returns 413 without the process reading the full body into memory, and is still logged with the `"missing, invalid, or oversized Content-Length"` marker instead of the raw body.
    - `curl -s -X POST http://127.0.0.1:8000/mcp -H "Transfer-Encoding: chunked" --data-binary '...'` (or `http.client` with `Transfer-Encoding: chunked` set manually) returns **HTTP 411**, not 413, and is logged with the `"Transfer-Encoding: chunked not supported"` marker -- concrete regression test for `[RN2-3]`.
    - A raw request with two `Content-Length` headers (constructible via `http.client.HTTPConnection.putheader` called twice, or a raw socket) returns **HTTP 400**, not 413, and is logged with the `"duplicate Content-Length headers"` marker -- concrete regression test for `[RN2-4]`.
+   - A raw request with two `Transfer-Encoding` headers (e.g. `identity` then `chunked`, constructible via a raw socket or `http.client.HTTPConnection.putheader` called twice) returns **HTTP 400**, not 411/200, and is logged with the `"duplicate Transfer-Encoding headers"` marker -- concrete regression test for `[RN3-2]`.
    - `wc -l honeypot.jsonl` after each of the above requests increases by exactly 1 each time -- no request in this task's test matrix is silently dropped.
    - Stderr prints one sanitized single-line summary per request with no raw newlines/control chars even when the request body/headers contain them.
    - A client that opens a raw TCP connection to the port and sends nothing for longer than `SOCKET_TIMEOUT_SECONDS` causes that connection to be closed by the server, **and produces one JSONL line with `stdlib_rejection: true`** (concrete regression test for `[RN2-1]`'s "stall before any request line" case) -- verify via `socket.timeout`-triggered cleanup (handler thread count / open-fd count returns to baseline) without hanging the server or blocking other requests.
    - A raw socket sending a non-HTTP-conforming line (e.g. `b"garbage not a request\r\n\r\n"`) or a request line over 65536 bytes produces one JSONL line with `stdlib_rejection: true` and a `detail` string naming the stdlib's own rejection reason -- concrete regression test for `[RN2-1]`'s other two cases.
-   - Opening `MAX_CONCURRENT_CONNECTIONS + 5` raw sockets simultaneously (without completing a request) does not exhaust threads or crash the server; the extra connections beyond the cap are closed by the server without a response and without a log line (the one remaining accepted exception named in § Data Flow).
+   - A raw socket that sends `b"\r\n"` (a blank leading request line) immediately followed by a real, well-formed request on the same connection produces **two** JSONL lines: one `stdlib_rejection: true` record for the blank line, and one normal record for the real request that follows -- concrete regression test for `[RN3-1]`, confirming the real request is no longer silently dropped.
+   - A raw socket sending `MAX_LEADING_BLANK_REQUEST_LINES + 1` consecutive blank lines before any real request line produces exactly `MAX_LEADING_BLANK_REQUEST_LINES` `stdlib_rejection: true` records, then the connection closes with no further record for the final, bound-exceeding blank line -- concrete regression test for the documented bounded-by-design residual (see § Data Flow).
+   - Monkeypatching `build_stdlib_rejection_record` to raise and then triggering any stdlib-rejection case (e.g. a >65536-byte request line) still results in `super().log_error(...)`'s own stderr diagnostic being printed, no unhandled exception/unsanitized traceback reaching stderr, and the server continuing to serve subsequent requests normally -- concrete regression test for `[SEC3-a]`.
+   - Opening `MAX_CONCURRENT_CONNECTIONS + 5` raw sockets simultaneously (without completing a request) does not exhaust threads or crash the server; the extra connections beyond the cap are closed by the server without a response and without a log line (one of the two genuinely structurally-unloggable cases named in § Data Flow's updated three-item list).
    - `python3 -c "import mcp_honeypot"` opens no sockets/files (no `honeypot.jsonl` created by import alone).
 
 2. **Session-aware JSON-RPC dispatch: initialize, notifications/initialized, ping, and the -32600/-32602/-32603 error paths.** Replace the Task 1 dispatch stub with the real `dispatch(msg: dict, ctx: RequestContext) -> DispatchResult` and `METHODS` table (per the exact signature and behavior specified in § Data Flow). Implement:
@@ -528,18 +678,18 @@ class HoneypotRequestHandler(BaseHTTPRequestHandler):
    - `tools/call` with an unrecognized tool name returns a well-formed `isError:true` result (HTTP 200, `result` not `error`), connection stays alive.
    - `grep -nE "eval\(|exec\(|subprocess|urllib|socket\.socket|importlib" mcp_honeypot.py` matches nothing inside the tool-handler section (and none of the tool handler functions call `open()`).
 
-4. **CLI finishing touches, safety self-check, and README.** Finalize `--host`/`--port`/`--log-file` argparse help text and defaults (confirm log path resolves relative to CWD at start, per plan); confirm the log file is opened once in append mode in `main()` and the handle is reused for the process lifetime (not reopened per request); confirm `MAX_BODY_BYTES`, `SOCKET_TIMEOUT_SECONDS`, `MAX_CONCURRENT_CONNECTIONS`, `MAX_SESSIONS` are all named module-level constants (not magic numbers scattered through the file); do a full read-through/grep pass over the finished file confirming no forbidden identifiers (`eval(`, `exec(`, `subprocess`, `socket.socket`, `urllib`, `importlib`, `open(` outside the single log-file open call in `main()`) appear anywhere; add a short comment block near the top of `mcp_honeypot.py` stating the non-negotiable safety invariants (no real I/O beyond the log file, no outbound network, no dynamic execution of client-derived data).
+4. **CLI finishing touches, safety self-check, and README.** Finalize `--host`/`--port`/`--log-file` argparse help text and defaults (confirm log path resolves relative to CWD at start, per plan); confirm the log file is opened once in append mode in `main()` and the handle is reused for the process lifetime (not reopened per request); confirm `MAX_BODY_BYTES`, `SOCKET_TIMEOUT_SECONDS`, `MAX_CONCURRENT_CONNECTIONS`, `MAX_SESSIONS`, `MAX_LEADING_BLANK_REQUEST_LINES` are all named module-level constants (not magic numbers scattered through the file); do a full read-through/grep pass over the finished file confirming no forbidden identifiers (`eval(`, `exec(`, `subprocess`, `socket.socket`, `urllib`, `importlib`, `open(` outside the single log-file open call in `main()`) appear anywhere; add a short comment block near the top of `mcp_honeypot.py` stating the non-negotiable safety invariants (no real I/O beyond the log file, no outbound network, no dynamic execution of client-derived data).
 
    Update root `README.md` (currently a one-line stub) by adding one paragraph covering: how to run it (`python3 mcp_honeypot.py [--host H] [--port P] [--log-file PATH]`); where logs go (JSONL at `--log-file`, default `./honeypot.jsonl` relative to CWD, plus the sanitized stderr mirror); how to point an MCP client at it (`http://<host>:<port>/mcp`, streamable-HTTP transport, single-request/response only -- no SSE); and the following explicit caveats (not silent gaps `[SEC-4]`):
    - Default bind (`127.0.0.1`) is safe for local testing; rebinding to `0.0.0.0` to expose it as a real decoy is an explicit opt-in risk.
    - Built-in resource-exhaustion mitigations that do exist in v1 -- a `SOCKET_TIMEOUT_SECONDS` (10s) **per-read** timeout per connection (explicitly note this is a per-I/O idle timeout, not a total-connection-duration budget `[SEC2-a]`) and a `MAX_CONCURRENT_CONNECTIONS` (200) hard cap -- and that these are fixed constants near the top of the source file, not CLI flags, if an operator needs to tune them.
-   - `honeypot.jsonl` has **no rotation, size cap, or retention limit** in v1; unbounded disk growth under sustained traffic is an explicit operator responsibility, not something the tool manages `[SEC-4]`.
-   - `Transfer-Encoding: chunked` requests are rejected outright (HTTP 411) and duplicate `Content-Length` headers are rejected outright (HTTP 400) -- v1's scope is simple JSON-RPC-over-POST, not general-purpose HTTP framing `[RN2-3] [RN2-4]`.
-   - Exactly two narrow, named exceptions remain to "every request is logged," both structurally unloggable rather than merely unimplemented: connections refused at the `MAX_CONCURRENT_CONNECTIONS` cap, and a client that opens a connection and closes it again having sent zero bytes (no timeout, no error). Everything else -- including malformed/oversized request lines, unsupported HTTP verbs/versions, oversized headers, and a client stalling before completing a request line -- is now logged via the `log_error` override `[RN2-1]`.
+   - `honeypot.jsonl` has **no rotation, size cap, or retention limit** in v1; unbounded disk growth under sustained traffic is an explicit operator responsibility, not something the tool manages `[SEC-4]`. **New in Round 3 `[SEC3-b]`:** this includes rejected/malformed traffic, not just successfully-dispatched requests -- the `log_error`/`handle_one_request` overrides (see below) mean garbage/scanner traffic that the stdlib itself rejects (bad request lines, oversized headers, blank leading lines, etc.) now also writes and flushes a JSONL line each, so disk growth tracks *all* inbound connection attempts, not only well-formed JSON-RPC ones.
+   - `Transfer-Encoding: chunked` requests are rejected outright (HTTP 411), and duplicate `Content-Length` or duplicate `Transfer-Encoding` headers are each rejected outright (HTTP 400) -- v1's scope is simple JSON-RPC-over-POST, not general-purpose HTTP framing `[RN2-3] [RN2-4] [RN3-2]`.
+   - Three narrow, named cases remain where "every request is logged" doesn't fully hold, precisely enumerated rather than approximated: two are genuinely structurally unloggable (connections refused at the `MAX_CONCURRENT_CONNECTIONS` cap, and a client that opens a connection and closes it again having sent zero bytes -- no timeout, no error, no stdlib hook fires at all in either case); the third is deliberately bounded rather than eliminated (more than `MAX_LEADING_BLANK_REQUEST_LINES`, default 5, consecutive blank/whitespace-only leading lines before a real request line ever arrives -- everything up to that bound is logged, only a run longer than it silently drops the final line). Everything else -- including malformed/oversized request lines, unsupported HTTP verbs/versions, oversized headers, a client stalling before completing a request line, and (new in Round 3) a single leading blank request line (the RFC 7230 SS3.5-recommended case, and the specific gap this revision closed) -- is now logged via the `log_error` and `handle_one_request` overrides `[RN2-1] [RN3-1]`.
 
    **Acceptance:**
    - `python3 mcp_honeypot.py --help` documents all three flags with their defaults (still exactly three -- no new flags added).
-   - `README.md` contains the new paragraph(s) with run/log-location/client-URL/exposure-warning/disk-growth/chunked-and-duplicate-Content-Length/unlogged-exceptions content described above, appended to (not replacing) the existing project description.
+   - `README.md` contains the new paragraph(s) with run/log-location/client-URL/exposure-warning/disk-growth-including-rejected-traffic/chunked-and-duplicate-Content-Length-and-Transfer-Encoding/three-item-unlogged-cases content described above, appended to (not replacing) the existing project description.
    - The safety grep from Task 3's acceptance criterion, re-run against the complete file, still matches nothing.
    - A fresh clone + `python3 mcp_honeypot.py` + one `curl` round-trip + `Ctrl-C` leaves behind only `honeypot.jsonl` (already gitignored) with no other file writes anywhere on disk.
 
@@ -584,3 +734,21 @@ class HoneypotRequestHandler(BaseHTTPRequestHandler):
 | (a) `SOCKET_TIMEOUT_SECONDS` is per-I/O, not total-duration | Explicitly documented as an accepted v1 tradeoff rather than fixed with a new watchdog thread, given the existing `MAX_CONCURRENT_CONNECTIONS` cap already bounds the worst case (independently verified non-blocking by security review). See § Architecture Overview ("Total-duration vs. per-read timeout, an accepted tradeoff"), Task 4 (README caveat spelling out the per-read-not-total-duration distinction). |
 | (b) incomplete "two named exceptions" list has the same root cause as review-notes.md finding 1 | Resolved by the same `log_error` override fix -- see review-notes.md finding 1's row above. |
 | (c) whether `_emergency_fallback`'s JSONL write reuses the lock-guarded `JSONLogWriter.write()` | Made explicit: `_emergency_fallback` writes through the *same* `log_writer` instance (and therefore the same `threading.Lock`) as every other logging call site in the file -- stated as a named property, not left implicit. See § Architecture Overview (Logging layer bullet), § Data Flow (`_emergency_fallback` description, step 2), § Components (Logging core bullet), Task 1 (implementation note). |
+## Round 3 finding disposition (summary)
+
+**review-notes.md § Round 3:**
+
+| # | Severity | Finding | Resolved in |
+|---|---|---|---|
+| 1 | major | The `log_error()` fix from Round 2 still missed one case: `parse_request()`'s `if len(words) == 0: return False` branch (a blank/whitespace-only first request line) returns `False` without ever calling `send_error()`/`log_error()`, so the Round 2 override can never see it -- verified empirically against live CPython 3.14 (`b"\r\n"` produces zero response bytes and zero `log_error` calls). RFC 7230 SS3.5 recommends servers tolerate exactly this leading-blank-line pattern, meaning the *entire subsequent request* was silently lost with zero trace, not just the blank line -- exactly the scanner/probe traffic this honeypot most wants to capture. | New `handle_one_request()` override (a near-verbatim reproduction of the stdlib version with one inserted check) detects a blank/whitespace-only leading request line directly -- since it cannot be caught via `log_error()` -- logs it via a new `_log_blank_request_line()` helper (reusing `build_stdlib_rejection_record`), then loops to read the real request line, mirroring RFC 7230 SS3.5's own "SHOULD ignore" guidance. Bounded by a new `MAX_LEADING_BLANK_REQUEST_LINES = 5` constant so the fix itself can't become an unbounded per-connection read/log loop. The "what's covered and what genuinely isn't" list is corrected from an asserted "two" to a precisely-derived three items: two genuinely structurally-unloggable (semaphore-cap drop, zero-byte clean EOF) plus one bounded-by-design residual (more than `MAX_LEADING_BLANK_REQUEST_LINES` consecutive blank lines). See § Architecture Overview (Transport layer bullet, HTTP handler bullet, stdlib module list), § Components (constants bullet), § Data Flow ("Universal logging via a `handle_one_request` override" through the updated "what's covered and what genuinely isn't"), Task 1 (implementation + 3 new acceptance criteria), Task 4 (README caveat rewritten to name three cases, not two). |
+| 2 | minor | `_classify_content_length()`'s `Transfer-Encoding` check used `headers.get(...)` (first-occurrence only), inconsistent with the `get_all()` + explicit duplicate-detection already applied to `Content-Length`. A request with two `Transfer-Encoding` headers disagreeing on value could be misclassified. | `_classify_content_length()` now calls `headers.get_all("Transfer-Encoding")` and returns a new, distinct `"duplicate_transfer_encoding"` outcome (-> HTTP 400, own log marker, same "rejected outright regardless of agreement" policy already used for duplicate `Content-Length`) when more than one is present, checked before interpreting a single value. See § Data Flow (`_classify_content_length` code block, request-lifecycle pseudocode, "400/404/405/411/413 response shapes"), § Components, Task 1 (implementation + new acceptance criterion), Task 4 (README caveat), Testability Notes. |
+
+**security-plan-review.md § Round 3 (verdict APPROVED; 3 minor notes, 2 folded in as requested, 1 documentation-only with no action needed):**
+
+| Note | Disposition |
+|---|---|
+| (a) `log_error()` only wrapped the `log_writer.write()` call, not `build_stdlib_rejection_record`/`headers_to_dict`/`format % args` -- a bug in any of those could skip `super().log_error(...)` and leak an unsanitized traceback to stderr via `socketserver`'s generic `handle_error()`. | `log_error()`'s entire body is now wrapped in one `try/except Exception: pass`, mirroring `_handle_request`'s own outer-try-except pattern, with `super().log_error(format, *args)` called unconditionally afterward, outside the try, so it always runs exactly once regardless of what fails above it. See § Data Flow (`log_error` code block, `[SEC3-a]`), § Components (HTTP handler bullet), Task 1 (implementation + new acceptance criterion), Testability Notes. |
+| (b) Task 4's README disk-growth caveat predates the `log_error` override and reads as if growth comes only from valid/dispatched traffic; should note rejected/malformed traffic also contributes now. | Task 4's disk-growth caveat now explicitly states that rejected/malformed traffic (stdlib-rejected bad request lines, oversized headers, blank leading lines, etc.) also writes and flushes a JSONL line each, alongside dispatched requests. See Task 4 README caveats, `[SEC3-b]`. |
+| (c) `build_stdlib_rejection_record`'s `http_status: null` relies on a free-text `detail` string rather than a structured field -- a reasonable, already-acknowledged limitation, purely documentation, no action needed. | No design change made, per the security review's own assessment that this is documentation-only with no action needed. |
+
+**Verdict tracking:** `review-notes.md` Round 3 verdict was CHANGES REQUESTED (1 major, 1 minor -- both resolved above); `security-plan-review.md` Round 3 verdict was APPROVED (3 non-blocking minor notes -- 2 folded in above, 1 needs no action per the security reviewer's own note).
