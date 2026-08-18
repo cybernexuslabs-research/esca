@@ -3,14 +3,39 @@
   "slug": "mcp-honeypot",
   "branch": "goal/mcp-honeypot",
   "created_at": "2026-08-18T10:11:55Z",
-  "updated_at": "2026-08-18T11:55:00Z",
+  "updated_at": "2026-08-18T12:00:00Z",
   "phase": "plan_review",
   "plan_review": {
     "round": 4,
     "cap": 5,
     "verdict": "approved"
   },
-  "tasks": [],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "HTTP server, universal request lifecycle (including stdlib-rejection logging), and logging core",
+      "status": "pending",
+      "code_review": {"round": 0, "cap": 5, "verdict": "pending"}
+    },
+    {
+      "id": 2,
+      "title": "Session-aware JSON-RPC dispatch: initialize, notifications/initialized, ping, and the -32600/-32602/-32603 error paths",
+      "status": "pending",
+      "code_review": {"round": 0, "cap": 5, "verdict": "pending"}
+    },
+    {
+      "id": 3,
+      "title": "Fake tool catalog + tools/list + tools/call + -32602 argument validation",
+      "status": "pending",
+      "code_review": {"round": 0, "cap": 5, "verdict": "pending"}
+    },
+    {
+      "id": 4,
+      "title": "CLI finishing touches, safety self-check, and README",
+      "status": "pending",
+      "code_review": {"round": 0, "cap": 5, "verdict": "pending"}
+    }
+  ],
   "qa": {
     "round": 0,
     "cap": 5,
