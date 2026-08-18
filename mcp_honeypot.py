@@ -19,6 +19,8 @@ import argparse
 import json
 import sys
 import threading
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -104,18 +106,90 @@ def _build_error(id_, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message}}
 
 
+class InvalidParamsError(Exception):
+    """Raised by a method handler to signal a -32602 Invalid params
+    condition. Caught inside dispatch(), never escapes it. No handler
+    raises this yet (that lands with handle_tools_call's argument
+    validation); the plumbing exists here regardless."""
+
+
+SESSIONS: "OrderedDict[str, dict]" = OrderedDict()
+SESSIONS_LOCK = threading.Lock()
+
+
+def _issue_session_id() -> str:
+    session_id = uuid.uuid4().hex
+    with SESSIONS_LOCK:
+        if len(SESSIONS) >= MAX_SESSIONS:
+            SESSIONS.popitem(last=False)
+        SESSIONS[session_id] = {}
+    return session_id
+
+
+def handle_initialize(params: dict, ctx: RequestContext) -> dict:
+    return {
+        "protocolVersion": "2025-06-18",
+        "serverInfo": {"name": "mcp-honeypot", "version": "1.0.0"},
+        "capabilities": {"tools": {}},
+    }
+
+
+def handle_notifications_initialized(params: dict, ctx: RequestContext) -> dict:
+    return {}
+
+
+def handle_ping(params: dict, ctx: RequestContext) -> dict:
+    return {}
+
+
+METHODS = {
+    "initialize": handle_initialize,
+    "notifications/initialized": handle_notifications_initialized,
+    "ping": handle_ping,
+}
+
+
 def dispatch(msg: dict, ctx: RequestContext) -> DispatchResult:
     """`msg` is already known to be a dict with a string "method" (the
-    caller, _handle_request, validates this before calling dispatch).
+    caller, _handle_request, validates this before calling dispatch --
+    dispatch never needs to guard against non-dict/non-object top-level
+    input).
 
-    STUB (Task 1 only): always returns a -32601 Method not found error,
-    regardless of the requested method. Task 2 replaces this with the real
-    METHODS table / session-issuance logic. The signature below is final so
-    Task 2 does not need to touch the transport layer.
+    Looks up msg["method"] in METHODS; on a match, calls
+    handler(msg.get("params") or {}, ctx) inside
+    try/except InvalidParamsError (-> -32602) / except Exception (-> -32603).
+    On no match: -32601 Method not found.
+
+    If method == "initialize" and no error occurred, mints a new session id
+    and records it in SESSIONS (capped/evicting), regardless of whether msg
+    has an "id". Every other method call leaves session_id as None.
+
+    Never raises.
     """
-    id_ = msg.get("id")
-    response = _build_error(id_, -32601, "Method not found")
-    return DispatchResult(response=response, session_id=None)
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    handler = METHODS.get(method)
+    session_id = None
+
+    if handler is None:
+        result_or_error = {"error": {"code": -32601, "message": "Method not found"}}
+    else:
+        try:
+            result = handler(params, ctx)
+            result_or_error = {"result": result}
+            if method == "initialize":
+                session_id = _issue_session_id()
+        except InvalidParamsError as exc:
+            result_or_error = {"error": {"code": -32602, "message": str(exc)}}
+        except Exception:
+            result_or_error = {"error": {"code": -32603, "message": "Internal error"}}
+
+    if "id" not in msg:
+        return DispatchResult(response=None, session_id=session_id)
+    return DispatchResult(
+        response={"jsonrpc": "2.0", "id": msg["id"], **result_or_error},
+        session_id=session_id,
+    )
 
 
 def build_log_record(
