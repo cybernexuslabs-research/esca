@@ -63,6 +63,7 @@ env/
 .pytest_cache/
 .tox/
 .ipynb_checkpoints/
+/honeypot.jsonl
 
 # Java / JVM
 *.class

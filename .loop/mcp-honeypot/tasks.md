@@ -2,7 +2,7 @@
 
 Derived from `design.md` § Task Breakdown. Status is the source of truth in `state.json`; this file is the human-readable mirror — the orchestrator keeps both in sync.
 
-- [ ] 1. HTTP server, universal request lifecycle (including stdlib-rejection logging), and logging core
+- [x] 1. HTTP server, universal request lifecycle (including stdlib-rejection logging), and logging core
 - [ ] 2. Session-aware JSON-RPC dispatch: initialize, notifications/initialized, ping, and the -32600/-32602/-32603 error paths
 - [ ] 3. Fake tool catalog + tools/list + tools/call + -32602 argument validation
 - [ ] 4. CLI finishing touches, safety self-check, and README
