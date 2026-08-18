@@ -41,3 +41,40 @@ On the targeted Python 3.10+ runtime this is not an active terminal-injection ex
 | minor | The four body-framing-rejection branches in `_handle_request` never drain the pending body or set `self.close_connection = True`, risking misparsed request boundaries on the same keep-alive connection (self-contained, not a smuggling vector against other clients). Carried forward, unresolved since task 1 round 1. | mcp_honeypot.py:677-689 |
 
 **Verdict:** CHANGES REQUESTED
+
+## Round 2 — loop-security (code-phase)
+
+Scope: independent re-verification of the round-1 MAJOR fix (`log_message` no-op override added to `HoneypotRequestHandler`), re-check of the two carried-forward minors, and a fresh full-file safety-rule sweep, per this round's charter as the final gate before QA.
+
+**Fix verification — stdlib duplicate-stderr-line finding (round 1 MAJOR), now empirically re-tested and confirmed resolved:**
+
+- Read CPython 3.14's actual `http.server` source (`log_request`, `log_message`, `log_error`, `send_response`) to confirm the mechanics before testing:
+  - `send_response()` → `log_request()` → `self.log_message(...)`.
+  - Base `log_error()` → `self.log_message(...)`.
+  - Base `log_message()`'s *only* effect is `sys.stderr.write(...)` — it has no other side effect (no state mutation, no control-flow branching elsewhere depends on it). Confirmed by reading the stdlib source directly, not inferred.
+  - Because both call sites invoke `self.log_message(...)` (not `BaseHTTPRequestHandler.log_message(...)` explicitly), Python's normal method resolution means the project's override on `HoneypotRequestHandler` is what actually runs in both cases — including via `super().log_error(format, *args)` at the end of the project's own `log_error` override, which internally calls `self.log_message(...)` and thus also resolves to the no-op.
+- Re-ran the round-1 empirical test (raw socket, ANSI-escape + control-byte injection in the request path, on the normal `_handle_request`/`send_response` success path): stderr now contains **exactly one line**, 315 bytes, sanitized (`\x1b` bytes stripped, leaving literal `31m`/`0m` fragments) and truncated at the project's 300-char cap (`...(truncated)`). No second stdlib-originated line. Confirmed via `wc -l` (1) and full hex dump.
+- Ran a second empirical test targeting the `log_error()` path specifically (malformed request line — `GARBAGE \x1b[31mINJECTED\x1b[0m REQUEST LINE\r\n\r\n` — triggers stdlib's `send_error` → `log_error`): stderr again contains exactly one sanitized `stdlib_rejection` line, no second raw line, and the JSONL record is correctly written with `stdlib_rejection: true`.
+- Ran a third empirical test on a normal successful `initialize` request to confirm the suppression doesn't break anything functionally: response body/headers/status are correct, JSONL and stderr both still produce their intended single summary line.
+- **Conclusion: the fix works as claimed.** stderr output is now exclusively the project's own `sanitize_for_stderr`-routed, length-capped summary line, on every tested code path (normal response, stdlib rejection). The module docstring's invariant ("the stderr mirror must always go through sanitize_for_stderr") is now factually accurate.
+- **No inadvertent suppression of anything security-relevant.** `log_message`'s sole documented and actual behavior in CPython is the stderr write itself; nothing else in `http.server`'s request lifecycle (response sending, header writing, connection closing, timeout handling) depends on or is gated by `log_message`/`log_request`/`log_error` being called through to the base implementation. Suppressing it silences no side channel other than the exact stderr write it was added to silence.
+
+**Carried-forward minors — re-confirmed present, status unchanged, still non-blocking:**
+- `_classify_content_length`'s `raw.isdigit()` accepts non-ASCII Unicode digit characters that `int(raw)` can't parse base-10; raises inside the helper, fully caught by the outer `except Exception` in `_handle_request` (degrades to a logged 500). Confirmed still present, unresolved, at `mcp_honeypot.py:97`. Still minor: not exploitable beyond a self-inflicted 500 for the requester.
+- None of the four body-framing-rejection branches (`chunked`/`duplicate_content_length`/`duplicate_transfer_encoding`/`missing_or_invalid`) drain the pending body or set `self.close_connection = True`. Confirmed still present, unresolved, at `mcp_honeypot.py:686-699` (line numbers shifted slightly from round 1 due to the `log_message` insertion earlier in the file; behavior unchanged). Still minor: self-contained to the offending keep-alive connection, not a cross-client smuggling vector, bounded by existing timeout/size caps.
+
+**Full-file safety-rule sweep (re-run fresh for this round):**
+- `eval(`/`exec(`/`subprocess`/`__import__`/`importlib` — zero hits outside module-docstring prose.
+- `socket.`/`urllib`/`requests.`/`smtplib`/`http.client`/`ftplib`/`telnetlib` — zero hits anywhere in the file. No outbound network path.
+- `open(`/`pathlib`/`os.path`/`os.remove`/`os.system` — exactly one hit, the same `open(args.log_file, "a", ...)` in `main()` as round 1; append mode, no truncation, no other file/path APIs used.
+- `pickle`/`marshal`/`yaml.load`/`shelve` — zero hits. No unsafe deserialization anywhere.
+- Confirmed the diff under review (`mcp_honeypot.py` + `README.md`) is limited to: the new `log_message` no-op override, and argparse help-text/README wording clarifying `--log-file`'s CWD-relative default resolution. Neither introduces any new risky pattern (no new I/O, no new network calls, no new dynamic execution).
+
+**README cross-check:** the "Running it" paragraph's claim ("a sanitized, control-character-stripped one-line human-readable summary mirrored to stderr") is now accurate given the fix — previously it was contradicted by the stdlib duplicate-line behavior found in round 1; that gap no longer exists. No further README update needed on this point.
+
+| Severity | Finding | Location |
+|---|---|---|
+| minor | `raw.isdigit()` in `_classify_content_length` accepts non-ASCII Unicode digit characters that `int(raw)` cannot parse, raising inside the helper (caught by the outer handler, degrades to a logged 500 — not exploitable). Carried forward, unresolved since task 1 round 1. | mcp_honeypot.py:97 |
+| minor | The four body-framing-rejection branches in `_handle_request` never drain the pending body or set `self.close_connection = True`, risking misparsed request boundaries on the same keep-alive connection (self-contained, not a smuggling vector against other clients). Carried forward, unresolved since task 1 round 1. | mcp_honeypot.py:686-699 |
+
+**Verdict:** APPROVED

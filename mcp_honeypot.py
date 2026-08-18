@@ -627,6 +627,15 @@ class HoneypotRequestHandler(BaseHTTPRequestHandler):
             pass
         super().log_error(format, *args)
 
+    def log_message(self, format: str, *args) -> None:
+        """Suppresses BaseHTTPRequestHandler's default stderr write. Both
+        log_request() (called by send_response() on normal completions) and
+        log_error() (overridden above) delegate to this method; the project's
+        own sanitized, capped summary is already emitted at every call site
+        via emit_stderr_summary()/log_error(), so this must stay a no-op to
+        avoid a second, uncapped, unsanitized line reaching stderr."""
+        pass
+
     def do_GET(self) -> None:
         self._handle_request("GET")
 
@@ -807,7 +816,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--log-file",
         default="./honeypot.jsonl",
-        help="Path to the JSONL log file (default: ./honeypot.jsonl)",
+        help=(
+            "Path to the JSONL log file (default: ./honeypot.jsonl, resolved "
+            "relative to the current working directory at startup, not the "
+            "script's location)"
+        ),
     )
     return parser
 
