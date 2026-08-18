@@ -3,8 +3,8 @@
   "slug": "mcp-honeypot",
   "branch": "goal/mcp-honeypot",
   "created_at": "2026-08-18T10:11:55Z",
-  "updated_at": "2026-08-18T12:00:00Z",
-  "phase": "plan_review",
+  "updated_at": "2026-08-18T12:02:00Z",
+  "phase": "building",
   "plan_review": {
     "round": 4,
     "cap": 5,
@@ -14,7 +14,7 @@
     {
       "id": 1,
       "title": "HTTP server, universal request lifecycle (including stdlib-rejection logging), and logging core",
-      "status": "pending",
+      "status": "in_progress",
       "code_review": {"round": 0, "cap": 5, "verdict": "pending"}
     },
     {
