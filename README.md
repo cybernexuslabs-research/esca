@@ -12,3 +12,7 @@ Run it directly with the standard library, no dependencies to install: `python3 
 - `honeypot.jsonl` has no rotation, size cap, or retention limit in v1. Unbounded disk growth under sustained traffic is an explicit operator responsibility, not something the tool manages -- and this includes rejected/malformed traffic, not just successfully-dispatched requests: the stdlib-rejection logging hooks mean garbage/scanner traffic (bad request lines, oversized headers, blank leading lines, etc.) also writes a JSONL line each.
 - `Transfer-Encoding: chunked` requests are rejected outright (HTTP 411), and duplicate `Content-Length` or duplicate `Transfer-Encoding` headers are each rejected outright (HTTP 400) -- v1's scope is simple JSON-RPC-over-POST, not general-purpose HTTP framing.
 - "Every request is logged" doesn't fully hold in three narrow, named cases. Two are genuinely structurally unloggable: connections refused at the `MAX_CONCURRENT_CONNECTIONS` cap, and a client that opens a connection and closes it again having sent zero bytes. The third is deliberately bounded rather than eliminated: more than `MAX_LEADING_BLANK_REQUEST_LINES` (default 5) consecutive blank/whitespace-only leading lines before a real request line ever arrives -- everything up to that bound is logged, and only a run longer than it silently drops the final line. Everything else is logged.
+
+## Testing
+
+Run the test suite with `python3 -m unittest test_mcp_honeypot -v` (57 tests, stdlib `unittest`, no extra dependencies).
