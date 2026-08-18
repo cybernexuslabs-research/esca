@@ -33,7 +33,7 @@
       "id": 4,
       "title": "CLI finishing touches, safety self-check, and README",
       "status": "in_progress",
-      "code_review": {"round": 0, "cap": 5, "verdict": "pending"}
+      "code_review": {"round": 1, "cap": 5, "verdict": "changes_requested"}
     }
   ],
   "qa": {
